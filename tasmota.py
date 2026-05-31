@@ -71,6 +71,10 @@ MQTT_USER = os.environ.get("TASMOTA_MQTT_USER", "")
 MQTT_PASS = os.environ.get("TASMOTA_MQTT_PASS", "")
 POLL_INTERVAL = int(os.environ.get("TASMOTA_POLL_INTERVAL", "30"))
 
+# How long to wait for a Status 11 probe response before discarding
+# the pending device (seconds).
+PROBE_TIMEOUT = int(os.environ.get("TASMOTA_PROBE_TIMEOUT", "15"))
+
 # ---------------------------------------------------------------------
 # Dry-run shim
 # ---------------------------------------------------------------------
@@ -140,20 +144,16 @@ class TasmotaDevice:
         kwargs = {}
 
         if VENUS_OS and dbus:
-            # Each service needs its own private D-Bus connection.
-            # dbus.SystemBus() is a shared singleton - all services would
-            # try to register '/' on the same connection and collide.
-            # dbus.bus.BusConnection gives a fresh private connection each time.
-            private_bus = dbus.bus.BusConnection(
-                dbus.bus.BusConnection.TYPE_SYSTEM
-            )
+            # Use a private D-Bus connection per service to avoid
+            # path collision when multiple services register '/'.
+            private_bus = dbus.SystemBus(private=True)
             kwargs["bus"] = private_bus
-            kwargs["register"] = False  # new velib API: add paths first, then register
+            kwargs["register"] = False  # add paths first, then register
 
         svc = VeDbusService(svc_name, **kwargs)
 
         svc.add_path("/Mgmt/ProcessName", __file__)
-        svc.add_path("/Mgmt/ProcessVersion", "1.1.0")
+        svc.add_path("/Mgmt/ProcessVersion", "1.2.0")
         svc.add_path("/Mgmt/Connection", f"MQTT {MQTT_HOST}")
 
         svc.add_path("/ProductName", f"Tasmota ({self.friendly_name})")
@@ -243,7 +243,7 @@ class TasmotaDevice:
                 1
             )
 
-        # Call register() after all paths are added (new velib API)
+        # Register after all paths are added (new velib API)
         if VENUS_OS and dbus and hasattr(svc, "register"):
             svc.register()
 
@@ -338,9 +338,16 @@ class TasmotaDiscovery:
 
     def __init__(self):
 
-        self._devices = {}
+        self._devices: dict[str, TasmotaDevice] = {}
         self._lock = threading.Lock()
         self._mqttc = None
+
+        # Devices seen via LWT/mDNS but not yet confirmed as switches.
+        # Format: { device_id: threading.Timer }
+        # The Timer fires PROBE_TIMEOUT seconds after the probe is sent
+        # and discards the entry if no STATUS11 response has arrived.
+        self._pending: dict[str, threading.Timer] = {}
+        self._pending_lock = threading.Lock()
 
     # -----------------------------------------------------------------
     # MQTT setup
@@ -390,7 +397,9 @@ class TasmotaDiscovery:
         for topic in [
             "tele/+/LWT",
             "tele/+/INFO1",
+            "tele/+/INFO3",         # carries IP address on modern firmware
             "stat/+/STATUS",
+            "stat/+/STATUS11",      # probe response: contains POWER keys if switch
             "stat/+/POWER",
             "stat/+/POWER1",
             "stat/+/POWER2",
@@ -446,21 +455,75 @@ class TasmotaDiscovery:
             online = payload.lower() == "online"
 
             if online:
-                self._ensure_device(
-                    device_id,
-                    device_id,
-                    "unknown"
+                # Don't register yet — probe first to confirm it has relays.
+                self._probe_device(device_id)
+
+            else:
+                # Device going offline: mark existing registered device offline.
+                # If still pending (probe not yet answered), cancel and discard.
+                self._cancel_probe(device_id)
+
+                dev = self._get(device_id)
+
+                if dev:
+                    dev.set_online(False)
+
+            return
+
+        # -------------------------------------------------------------
+        # STATUS11 — probe response
+        # Only register the device if StatusSTS contains a POWER key.
+        # -------------------------------------------------------------
+        if subtopic == "STATUS11":
+
+            # Only act on devices we're actively probing.
+            if not self._is_pending(device_id):
+                # Already registered — ignore (can arrive during normal polls).
+                return
+
+            try:
+                data = json.loads(payload)
+                sts = data.get("StatusSTS", {})
+
+            except (json.JSONDecodeError, TypeError):
+                log.warning(
+                    "%s STATUS11 parse error — treating as non-switch",
+                    device_id
                 )
+                self._cancel_probe(device_id)
+                return
 
-                self._mqttc.publish(
-                    f"cmnd/{device_id}/Status",
-                    "0"
+            has_relay = any(
+                k.upper().startswith("POWER")
+                for k in sts.keys()
+            )
+
+            if not has_relay:
+                log.info(
+                    "%s has no POWER keys in STATUS11 — sensor device, skipping",
+                    device_id
                 )
+                self._cancel_probe(device_id)
+                return
 
-            dev = self._get(device_id)
+            # It's a switch. Cancel the timeout timer and promote to registered.
+            log.info(
+                "%s confirmed as switch device (STATUS11 keys: %s)",
+                device_id,
+                [k for k in sts.keys() if k.upper().startswith("POWER")]
+            )
 
-            if dev:
-                dev.set_online(online)
+            self._cancel_probe(device_id, confirmed=True)
+
+            # Create the device entry with a preliminary name.
+            dev = self._ensure_device(device_id, device_id, "unknown")
+            dev.set_online(True)
+
+            # Request full status to populate friendly name and channel count.
+            self._mqtt_publish(f"cmnd/{device_id}/Status", "0")
+
+            # Seed initial relay states from the STATUS11 response.
+            self._apply_status_sts(dev, sts)
 
             return
 
@@ -479,19 +542,41 @@ class TasmotaDiscovery:
             version = info.get("Version", "")
             ip = info.get("IPAddress", "unknown")
 
-            dev = self._ensure_device(
-                device_id,
-                fname,
-                ip
-            )
+            # Only update already-registered devices from INFO1.
+            # If still pending, the device has not been confirmed as a switch yet.
+            dev = self._get(device_id)
 
-            dev.set_firmware(version)
-            dev.set_online(True)
+            if dev:
+                dev.set_firmware(version)
+                dev.set_online(True)
+
+                if fname and fname != device_id:
+                    dev.update_name(fname)
 
             return
 
         # -------------------------------------------------------------
-        # STATUS
+        # INFO3 — carries IP address on modern Tasmota firmware
+        # -------------------------------------------------------------
+        if subtopic == "INFO3":
+
+            try:
+                info = json.loads(payload)
+                ip = info.get("IPAddress", "")
+
+            except (json.JSONDecodeError, TypeError):
+                return
+
+            dev = self._get(device_id)
+
+            if dev and ip:
+                with dev._lock:
+                    dev.ip = ip
+
+            return
+
+        # -------------------------------------------------------------
+        # STATUS (Status 0 response — friendly name + channel count)
         # -------------------------------------------------------------
         if subtopic == "STATUS":
 
@@ -512,12 +597,27 @@ class TasmotaDiscovery:
             except (json.JSONDecodeError, TypeError):
                 return
 
-            self._ensure_device(
-                device_id,
-                fname,
-                "unknown",
-                channels
-            )
+            # Only update already-registered (confirmed) devices.
+            dev = self._get(device_id)
+
+            if dev:
+                if fname and fname != device_id:
+                    dev.update_name(fname)
+
+                dev.set_online(True)
+
+                # Re-init service if channel count has changed.
+                # This is rare but handles multi-channel devices whose
+                # channel count wasn't known at initial registration.
+                if channels != dev.channels:
+                    log.info(
+                        "%s channel count changed %d -> %d, re-registering",
+                        device_id,
+                        dev.channels,
+                        channels
+                    )
+                    dev.channels = channels
+                    dev._init_service()
 
             return
 
@@ -542,6 +642,90 @@ class TasmotaDiscovery:
                 dev.set_power(channel, payload)
 
             return
+
+    # -----------------------------------------------------------------
+    # Probe management
+    # -----------------------------------------------------------------
+    def _probe_device(self, device_id: str):
+        """Send a Status 11 probe to check whether device has relays."""
+
+        with self._pending_lock:
+
+            if device_id in self._pending:
+                # Already probing — reset the timeout.
+                self._pending[device_id].cancel()
+
+            # Register a timeout that discards the probe if no response.
+            timer = threading.Timer(
+                PROBE_TIMEOUT,
+                self._probe_timeout,
+                args=(device_id,)
+            )
+            timer.daemon = True
+            timer.start()
+
+            self._pending[device_id] = timer
+
+        log.debug("Probing %s (Status 11)", device_id)
+
+        self._mqtt_publish(f"cmnd/{device_id}/Status", "11")
+
+    def _probe_timeout(self, device_id: str):
+        """Called when a probed device never replied — discard it."""
+
+        with self._pending_lock:
+
+            if device_id not in self._pending:
+                return  # already resolved
+
+            del self._pending[device_id]
+
+        log.info(
+            "%s probe timed out after %ds — no STATUS11 response, ignoring",
+            device_id,
+            PROBE_TIMEOUT
+        )
+
+    def _cancel_probe(self, device_id: str, confirmed: bool = False):
+        """Cancel the probe timer. confirmed=True means we got a valid response."""
+
+        with self._pending_lock:
+
+            timer = self._pending.pop(device_id, None)
+
+            if timer:
+                timer.cancel()
+
+        if not confirmed:
+            log.debug("Probe cancelled for %s", device_id)
+
+    def _is_pending(self, device_id: str) -> bool:
+
+        with self._pending_lock:
+            return device_id in self._pending
+
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+    def _apply_status_sts(self, dev: TasmotaDevice, sts: dict):
+        """Seed relay states from the StatusSTS block in a STATUS11 response."""
+
+        for key, val in sts.items():
+
+            upper = key.upper()
+
+            if not upper.startswith("POWER"):
+                continue
+
+            if upper == "POWER":
+                channel = 1
+            else:
+                try:
+                    channel = int(upper[5:])
+                except ValueError:
+                    continue
+
+            dev.set_power(channel, str(val))
 
     # -----------------------------------------------------------------
     # Device registry
@@ -578,6 +762,9 @@ class TasmotaDiscovery:
                 self._devices[device_id] = dev
 
             else:
+                # Device already registered — update name only if we now
+                # have a real name and previously only had the device_id
+                # placeholder. Channel count changes are handled in STATUS.
                 dev = self._devices[device_id]
 
                 if (
@@ -597,11 +784,13 @@ class TasmotaDiscovery:
     # Polling
     # -----------------------------------------------------------------
     def _poll_all(self):
+        """Send a Status 11 probe to all already-registered devices."""
 
         with self._lock:
             ids = list(self._devices.keys())
 
         for did in ids:
+            # For registered devices we poll power state directly.
             self._mqttc.publish(
                 f"cmnd/{did}/Power",
                 ""
@@ -635,17 +824,12 @@ class TasmotaDiscovery:
             log.info("zeroconf not installed - mDNS disabled")
             return
 
-        def _on_service(zeroconf, service_type, name, state_change, **kwargs):
-            zc = zeroconf
-            svc_type = service_type
+        def _on_service(zeroconf, service_type, name, state_change):
 
             if state_change is not ServiceStateChange.Added:
                 return
 
-            info = zc.get_service_info(
-                svc_type,
-                name
-            )
+            info = zeroconf.get_service_info(service_type, name)
 
             if not info:
                 return
@@ -668,21 +852,14 @@ class TasmotaDiscovery:
             )
 
             log.info(
-                "mDNS found: %s @ %s",
+                "mDNS found: %s @ %s — probing",
                 device_id,
                 ip
             )
 
-            self._ensure_device(
-                device_id,
-                device_id,
-                ip
-            )
-
-            self._mqttc.publish(
-                f"cmnd/{device_id}/Status",
-                "0"
-            )
+            # Use the same probe path as LWT: don't register until
+            # STATUS11 confirms it has relay outputs.
+            self._probe_device(device_id)
 
         zc = Zeroconf()
 
