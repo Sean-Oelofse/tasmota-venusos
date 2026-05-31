@@ -1,11 +1,16 @@
 #!/bin/bash
 # =============================================================================
 # install_tasmota_service.sh
-# Installs tasmota_discovery.py as a daemontools service on Venus OS.
+# Installs tasmota.py as a daemontools service on Venus OS.
 #
-# Usage:
+# One-line install from GitHub (recommended):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Sean-Oelofse/tasmota-venusos/main/install_tasmota_service.sh) --mqtt-host 127.0.0.1
+#
+# Or clone and run locally:
+#   git clone https://github.com/Sean-Oelofse/tasmota-venusos.git
+#   cd tasmota-venusos
 #   chmod +x install_tasmota_service.sh
-#   ./install_tasmota_service.sh [options]
+#   ./install_tasmota_service.sh --mqtt-host 127.0.0.1
 #
 # Options:
 #   --mqtt-host   MQTT broker host (default: 127.0.0.1)
@@ -19,14 +24,18 @@
 
 set -e
 
+GITHUB_RAW="https://raw.githubusercontent.com/Sean-Oelofse/tasmota-venusos/main"
+
 SERVICE_NAME="tasmota-discovery"
 INSTALL_DIR="/opt/victronenergy/tasmota-discovery"
 SERVICE_DIR="/service/${SERVICE_NAME}"
 SVCS_PERSISTENT="/data/conf/runit/${SERVICE_NAME}"
 LOG_DIR="/var/log/${SERVICE_NAME}"
 
+# If tasmota.py lives next to this script (local clone), use it directly.
+# Otherwise the installer will download it from GitHub.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DISCOVERY_SCRIPT="${SCRIPT_DIR}/tasmota.py"
+LOCAL_SCRIPT="${SCRIPT_DIR}/tasmota.py"
 
 # Defaults
 MQTT_HOST="127.0.0.1"
@@ -81,26 +90,22 @@ if [[ $UNINSTALL -eq 1 ]]; then
 
     info "Uninstalling ${SERVICE_NAME}..."
 
-    # Stop service if running
     if [[ -d "${SERVICE_DIR}" ]]; then
         sv stop "${SERVICE_DIR}" 2>/dev/null || true
         rm -rf "${SERVICE_DIR}"
         info "Removed ${SERVICE_DIR}"
     fi
 
-    # Remove persistent runit entry
     if [[ -d "${SVCS_PERSISTENT}" ]]; then
         rm -rf "${SVCS_PERSISTENT}"
         info "Removed ${SVCS_PERSISTENT}"
     fi
 
-    # Remove install directory
     if [[ -d "${INSTALL_DIR}" ]]; then
         rm -rf "${INSTALL_DIR}"
         info "Removed ${INSTALL_DIR}"
     fi
 
-    # Remove log directory
     if [[ -d "${LOG_DIR}" ]]; then
         rm -rf "${LOG_DIR}"
         info "Removed ${LOG_DIR}"
@@ -113,9 +118,6 @@ fi
 # -----------------------------------------------------------------------------
 # Pre-install checks
 # -----------------------------------------------------------------------------
-[[ -f "${DISCOVERY_SCRIPT}" ]] \
-    || die "tasmota.py not found at ${DISCOVERY_SCRIPT}\nRun this script from the same directory as tasmota.py."
-
 python3 --version &>/dev/null \
     || die "python3 not found."
 
@@ -123,16 +125,27 @@ python3 -c "import paho.mqtt.client" 2>/dev/null \
     || die "paho-mqtt not installed. Run: pip3 install paho-mqtt"
 
 # -----------------------------------------------------------------------------
-# Install files
+# Fetch tasmota.py — local copy takes priority, else download from GitHub
 # -----------------------------------------------------------------------------
-info "Creating install directory: ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 
-info "Copying tasmota.py"
-cp "${DISCOVERY_SCRIPT}" "${INSTALL_DIR}/tasmota.py"
+if [[ -f "${LOCAL_SCRIPT}" ]]; then
+    info "Using local tasmota.py from ${LOCAL_SCRIPT}"
+    cp "${LOCAL_SCRIPT}" "${INSTALL_DIR}/tasmota.py"
+else
+    info "tasmota.py not found locally — downloading from GitHub"
+    curl --fail --silent --show-error --location \
+        "${GITHUB_RAW}/tasmota.py" \
+        -o "${INSTALL_DIR}/tasmota.py" \
+        || die "Failed to download tasmota.py from GitHub. Check your internet connection."
+    info "Downloaded tasmota.py"
+fi
+
 chmod 755 "${INSTALL_DIR}/tasmota.py"
 
-# Write environment file (sourced by the run script)
+# -----------------------------------------------------------------------------
+# Write environment config
+# -----------------------------------------------------------------------------
 info "Writing environment config"
 cat > "${INSTALL_DIR}/environment" <<EOF
 TASMOTA_MQTT_HOST=${MQTT_HOST}
@@ -146,31 +159,25 @@ EOF
 chmod 600 "${INSTALL_DIR}/environment"
 
 # -----------------------------------------------------------------------------
-# Create runit service directory structure
-#
-# Venus OS uses daemontools/runit. Services live under /service/ but those
-# are wiped on reboot. The persistent location is /data/conf/runit/ which
-# rc.local symlinks back into /service/ on boot.
+# Create runit service structure
+# /data/conf/runit/ is persistent across firmware updates.
+# /service/ is tmpfs — symlinks are restored on boot via rc.local.
 # -----------------------------------------------------------------------------
 info "Creating runit service structure"
 mkdir -p "${SVCS_PERSISTENT}/log"
 
-# ---- run script ----
 cat > "${SVCS_PERSISTENT}/run" <<'RUNEOF'
 #!/bin/sh
-# Source environment variables
 if [ -f /opt/victronenergy/tasmota-discovery/environment ]; then
     set -a
     . /opt/victronenergy/tasmota-discovery/environment
     set +a
 fi
-
 exec 2>&1
 exec python3 /opt/victronenergy/tasmota-discovery/tasmota.py
 RUNEOF
 chmod 755 "${SVCS_PERSISTENT}/run"
 
-# ---- log/run script (svlogd rotating logger) ----
 mkdir -p "${LOG_DIR}"
 cat > "${SVCS_PERSISTENT}/log/run" <<LOGEOF
 #!/bin/sh
@@ -179,7 +186,7 @@ LOGEOF
 chmod 755 "${SVCS_PERSISTENT}/log/run"
 
 # -----------------------------------------------------------------------------
-# Symlink into /service/ so runit picks it up immediately
+# Symlink into /service/ for immediate pickup by runit
 # -----------------------------------------------------------------------------
 if [[ -L "${SERVICE_DIR}" ]]; then
     info "Removing existing symlink ${SERVICE_DIR}"
@@ -190,9 +197,7 @@ info "Symlinking ${SVCS_PERSISTENT} -> ${SERVICE_DIR}"
 ln -s "${SVCS_PERSISTENT}" "${SERVICE_DIR}"
 
 # -----------------------------------------------------------------------------
-# Ensure /data/conf/runit is picked up on reboot via rc.local
-# Venus OS already sources /data/rc.local on boot. We add a block that
-# creates any missing /service symlinks from /data/conf/runit/.
+# Patch /data/rc.local to restore symlinks on every reboot
 # -----------------------------------------------------------------------------
 RC_LOCAL="/data/rc.local"
 
@@ -225,7 +230,7 @@ fi
 # Start the service
 # -----------------------------------------------------------------------------
 info "Starting service via sv..."
-sleep 1  # give runit a moment to notice the new symlink
+sleep 1
 
 if sv status "${SERVICE_DIR}" &>/dev/null; then
     sv restart "${SERVICE_DIR}"
@@ -252,7 +257,9 @@ echo "    sv restart ${SERVICE_DIR}   # restart"
 echo "    sv stop ${SERVICE_DIR}      # stop"
 echo "    tail -f ${LOG_DIR}/current  # live log"
 echo ""
-echo "  To update the script after changes:"
-echo "    cp tasmota.py /opt/victronenergy/tasmota-discovery/"
-echo "    ./install_tasmota_service.sh --uninstall"
+echo "  To update to the latest version from GitHub:"
+echo "    bash <(curl -fsSL ${GITHUB_RAW}/install_tasmota_service.sh) --mqtt-host ${MQTT_HOST}"
+echo ""
+echo "  To uninstall:"
+echo "    bash <(curl -fsSL ${GITHUB_RAW}/install_tasmota_service.sh) --uninstall"
 echo ""
