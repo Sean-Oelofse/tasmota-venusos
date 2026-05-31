@@ -1,5 +1,7 @@
 # tasmota-venusos
 Python integration for Tasmota that allows switch panel integration.
+
+
 <img width="438" height="540" alt="image" src="https://github.com/user-attachments/assets/e35ea3f1-bfd4-4bc2-b525-076ef457cca3" />
 
 
