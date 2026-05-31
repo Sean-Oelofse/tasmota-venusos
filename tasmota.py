@@ -65,7 +65,7 @@ except Exception:
 # ---------------------------------------------------------------------
 # MQTT config
 # ---------------------------------------------------------------------
-MQTT_HOST = os.environ.get("TASMOTA_MQTT_HOST", "192.168.10.80")
+MQTT_HOST = os.environ.get("TASMOTA_MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("TASMOTA_MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("TASMOTA_MQTT_USER", "")
 MQTT_PASS = os.environ.get("TASMOTA_MQTT_PASS", "")
