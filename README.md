@@ -8,13 +8,19 @@ Python integration for Tasmota that allows switch panel integration.
 
 _________________________________________________________________________
 Installation Instructions.
-Root access is required see https://www.victronenergy.com/live/ccgx:root_access#root_access
-ssh root@venus.local or ssh root@192.xxx.xxx.xxx
+Root access is required see https://www.victronenergy.com/live/ccgx:root_access#root_access:
+     
+     ssh root@venus.local 
+or 
+
+     ssh root@192.xxx.xxx.xxx
+
 Make sure both files install_tasmota_service.sh and tasmota.py are in the same directory e.g /data.
 Then while in the same directory run:
      
      ./install_tasmota_service.sh --mqtt-host 127.0.0.1
 --mqtt-host can be changed to match your current mqtt broker 
+
 Or if you would like a simple way to install run:
     
     bash <(curl -fsSL https://raw.githubusercontent.com/Sean-Oelofse/tasmota-venusos/main/install_tasmota_service.sh) --mqtt-host 127.0.0.1
