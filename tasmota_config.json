@@ -1,0 +1,61 @@
+{
+  "_comment": "tasmota-venusos device configuration. Place this file at /data/tasmota_config.json",
+
+  "devices": {
+    "tasmota_AABBCC": {
+      "_comment": "Key is the Tasmota device_id (topic name). Leave empty {} to use auto-discovered defaults.",
+
+      "friendly_name": "Pool Pump",
+
+      "channels": {
+        "0": {
+          "name": "Speed",
+          "group": "Pool",
+          "type": 9,
+          "valid_types": 514,
+          "show_ui_control": 1,
+
+          "_comment_type9": "Type 9 = Three-state switch. State values map to: 0=Off, 1=Low, 2=High (or whatever your three positions are).",
+          "_comment_auto":  "auto=0 means the user controls state from the UI. auto=1 means your automation controls /State and the UI is read-only.",
+          "auto": 0,
+
+          "state_labels": ["Off", "Low", "High"],
+
+          "_comment_relay_map": "Maps each state value (0/1/2) to the relay commands sent over MQTT.",
+          "state_relay_map": {
+            "0": {"POWER1": "OFF", "POWER2": "OFF"},
+            "1": {"POWER1": "ON",  "POWER2": "OFF"},
+            "2": {"POWER1": "ON",  "POWER2": "ON"}
+          }
+        }
+      }
+    },
+
+    "tasmota_DDEEFF": {
+      "friendly_name": "Fan Controller",
+
+      "channels": {
+        "0": {
+          "name": "Fan Speed",
+          "group": "HVAC",
+          "type": 9,
+          "valid_types": 514,
+          "show_ui_control": 1,
+          "auto": 0,
+
+          "state_labels": ["Off", "Medium", "Max"],
+
+          "state_relay_map": {
+            "0": {"POWER": "OFF"},
+            "1": {"POWER": "ON"},
+            "2": {"POWER": "ON"}
+          }
+        }
+      }
+    }
+  },
+
+  "_comment_valid_types": "valid_types is a bitmask. Bit 1 (=2) = toggle, bit 9 (=512) = three-state switch. 514 = toggle + three-state. Adjust per channel.",
+  "_comment_state_relay_map": "state_relay_map lets you define which Tasmota POWER commands fire for each of the three states. Use POWER for single-relay devices, POWER1/POWER2/etc for multi-relay.",
+  "_comment_type_values": "Type values: 0=momentary, 1=toggle, 2=dimmable, 4=stepped, 6=dropdown, 7=basic slider, 8=numeric, 9=three-state, 10=bilge pump"
+}
