@@ -7,7 +7,6 @@ import json
 import logging
 import threading
 import socket
-import re
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -23,6 +22,265 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("tasmota_discovery")
+
+# ---------------------------------------------------------------------
+# Config file
+# ---------------------------------------------------------------------
+CONFIG_PATH           = os.environ.get("TASMOTA_CONFIG", "/data/tasmota_config.json")
+CONFIG_WATCH_INTERVAL = int(os.environ.get("TASMOTA_CONFIG_WATCH", "10"))
+
+
+class ConfigManager:
+    """Watches tasmota_config.json and notifies on change.
+
+    The only thing the config does is supply a ``state_relay_map`` per device.
+    If present the device registers as a three-state switch; otherwise it's
+    a plain toggle.  Everything else (name, group, icon) stays in the GUI.
+
+    Config examples::
+
+        # Single-relay three-state switch (simplest form)
+        {
+          "devices": {
+            "borehole_0": {
+              "three_state": true,
+              "labels": ["Off", "On", "Auto"]
+            }
+          }
+        }
+
+        # Multi-relay three-state switch (explicit relay combinations)
+        {
+          "devices": {
+            "tasmota_AABBCC": {
+              "state_relay_map": {
+                "0": {"POWER1": "OFF", "POWER2": "OFF"},
+                "1": {"POWER1": "ON",  "POWER2": "OFF"},
+                "2": {"POWER1": "ON",  "POWER2": "ON"}
+              }
+            }
+          }
+        }
+    """
+
+    def __init__(self, path: str):
+        self.path             = path
+        self._lock            = threading.Lock()
+        self._devices: dict   = {}
+        self._mtime: float    = 0.0
+        self._callbacks: list = []
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            if self._devices:
+                log.info("Config removed - reverting devices to toggle defaults")
+                old = set(self._devices)
+                with self._lock:
+                    self._devices = {}
+                    self._mtime   = 0.0
+                self._fire(set(), old, set())
+            return
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                new_devs = json.load(f).get("devices", {})
+        except Exception as exc:
+            log.warning("Config parse error (%s) - keeping previous config", exc)
+            return
+        old_devs = self._devices
+        added    = set(new_devs) - set(old_devs)
+        removed  = set(old_devs) - set(new_devs)
+        modified = {d for d in set(new_devs) & set(old_devs) if new_devs[d] != old_devs[d]}
+        with self._lock:
+            self._devices = new_devs
+            self._mtime   = mtime
+        if added or removed or modified:
+            log.info("Config reloaded - added=%s removed=%s modified=%s", added, removed, modified)
+            self._fire(added, removed, modified)
+
+    def _fire(self, added, removed, modified):
+        for cb in self._callbacks:
+            try:
+                cb(added, removed, modified)
+            except Exception as exc:
+                log.exception("Config callback error: %s", exc)
+
+    def register_callback(self, fn):
+        self._callbacks.append(fn)
+
+    def start_watcher(self):
+        def _loop():
+            while True:
+                time.sleep(CONFIG_WATCH_INTERVAL)
+                self._load()
+        threading.Thread(target=_loop, daemon=True, name="config-watcher").start()
+        log.info("Config watcher started (polling %s every %ds)", self.path, CONFIG_WATCH_INTERVAL)
+
+    def relay_map(self, device_id: str) -> dict:
+        """Return the effective relay map for a device.
+
+        If an explicit ``state_relay_map`` is present in the config it is used
+        as-is (multi-relay / custom behaviour).
+
+        If ``"three_state": true`` is set (and no explicit map), a standard
+        single-relay three-state map is generated automatically:
+            0 -> POWER OFF
+            1 -> POWER ON
+            2 -> POWER ON  (Auto - physically identical to On)
+
+        Returns an empty dict for plain toggle devices.
+        """
+        with self._lock:
+            dev = self._devices.get(device_id, {})
+        explicit = dev.get("state_relay_map")
+        if explicit:
+            return explicit
+        if dev.get("three_state"):
+            return {
+                "0": {"POWER": "OFF"},
+                "1": {"POWER": "ON"},
+                "2": {"POWER": "ON"},
+            }
+        return {}
+
+    def reverse_relay_map(self, device_id: str) -> dict:
+        """Return a mapping from frozenset of (key,val) pairs -> state int.
+
+        Allows looking up the state value from a set of observed relay states.
+        Example: {frozenset({("POWER1","ON"),("POWER2","OFF")}): 1}
+
+        When multiple states share the same relay combination (e.g. state 1 "On"
+        and state 2 "Auto" both map to POWER=ON on a single-relay device), the
+        lowest state number wins.  Higher states like "Auto" can only be set
+        explicitly by a Node-RED write - they must never be inferred from a
+        relay report that is physically identical to a lower state.
+        """
+        result = {}
+        for state_str, commands in self.relay_map(device_id).items():
+            key       = frozenset((k.upper(), v.upper()) for k, v in commands.items())
+            state_val = int(state_str)
+            if key not in result or state_val < result[key]:
+                result[key] = state_val
+        return result
+
+    def is_three_state(self, device_id: str) -> bool:
+        """True when the device should be registered as a three-state switch."""
+        with self._lock:
+            dev = self._devices.get(device_id, {})
+        return bool(dev.get("three_state") or dev.get("state_relay_map"))
+
+    def auto_mode(self, device_id: str) -> int:
+        """Return 0 (manual/user controls UI) or 1 (auto/driver controls UI)."""
+        with self._lock:
+            return int(self._devices.get(device_id, {}).get("auto", 0))
+
+    def labels(self, device_id: str) -> list:
+        """Return the three state labels, defaulting to Off/On/Auto."""
+        with self._lock:
+            return self._devices.get(device_id, {}).get("labels", ["Off", "On", "Auto"])
+
+    def group(self, device_id: str) -> str:
+        """Return the stored group name, defaulting to 'Tasmota'."""
+        with self._lock:
+            return self._devices.get(device_id, {}).get("group", "Tasmota")
+
+    def register_device(self, device_id: str, friendly_name: str, ip: str, channels: int):
+        """Add a discovered device to the config file if not already present.
+
+        Existing entries are never touched, so any state_relay_map you have
+        added by hand is preserved.
+        """
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    raw = json.load(f)
+            except Exception:
+                raw = {}
+        else:
+            raw = {}
+
+        devices = raw.setdefault("devices", {})
+        if device_id in devices:
+            return  # already listed, don't overwrite
+
+        devices[device_id] = {
+            "_name":      friendly_name,
+            "_ip":        ip,
+            "_channels":  channels,
+            # Set to true (or write 1 to /Settings/ThreeState on D-Bus) to make this
+            # a three-state switch (Off / On / Auto) for a single-relay device.
+            "three_state": False,
+            # For multi-relay devices where each state drives a different relay
+            # combination, use the explicit map instead of three_state:
+            #   "state_relay_map": {
+            #     "0": {"POWER1": "OFF", "POWER2": "OFF"},
+            #     "1": {"POWER1": "ON",  "POWER2": "OFF"},
+            #     "2": {"POWER1": "ON",  "POWER2": "ON"}
+            #   }
+            #
+            # Optional: override the three state labels (default: Off / On / Auto)
+            #   "labels": ["Off", "On", "Auto"],
+            #
+            # Optional: start in auto mode (Node-RED controls /State, user cannot override)
+            #   "auto": 0
+        }
+
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+            log.info("Added %s to config file (%s)", device_id, self.path)
+            # Update mtime so the watcher doesn't re-fire for this write
+            with self._lock:
+                self._devices.setdefault(device_id, devices[device_id])
+                self._mtime = os.path.getmtime(self.path)
+        except Exception as exc:
+            log.warning("Could not write config file: %s", exc)
+
+    def update_device_field(self, device_id: str, key: str, value, notify: bool = True):
+        """Update a single field in a device's config entry and persist to disk.
+
+        notify=True (default) fires config-change callbacks so the device's
+        D-Bus service re-initialises.  Pass notify=False for cosmetic-only
+        changes (e.g. label renames) where a re-init is not needed.
+        """
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    raw = json.load(f)
+            except Exception:
+                raw = {}
+        else:
+            raw = {}
+
+        raw.setdefault("devices", {}).setdefault(device_id, {})[key] = value
+
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+            log.info("Config: set %s.%s = %r", device_id, key, value)
+        except Exception as exc:
+            log.warning("Could not write config file: %s", exc)
+            return
+
+        with self._lock:
+            old_val = self._devices.get(device_id, {}).get(key)
+            self._devices.setdefault(device_id, {})[key] = value
+            try:
+                self._mtime = os.path.getmtime(self.path)
+            except OSError:
+                pass
+
+        if notify and old_val != value:
+            self._fire(set(), set(), {device_id})
+
+
+CFG = ConfigManager(CONFIG_PATH)
 
 # ---------------------------------------------------------------------
 # Venus OS detection
@@ -65,10 +323,10 @@ except Exception:
 # ---------------------------------------------------------------------
 # MQTT config
 # ---------------------------------------------------------------------
-MQTT_HOST = os.environ.get("TASMOTA_MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.environ.get("TASMOTA_MQTT_PORT", "1883"))
-MQTT_USER = os.environ.get("TASMOTA_MQTT_USER", "")
-MQTT_PASS = os.environ.get("TASMOTA_MQTT_PASS", "")
+MQTT_HOST     = os.environ.get("TASMOTA_MQTT_HOST", "127.0.0.1")
+MQTT_PORT     = int(os.environ.get("TASMOTA_MQTT_PORT", "1883"))
+MQTT_USER     = os.environ.get("TASMOTA_MQTT_USER", "")
+MQTT_PASS     = os.environ.get("TASMOTA_MQTT_PASS", "")
 POLL_INTERVAL = int(os.environ.get("TASMOTA_POLL_INTERVAL", "30"))
 
 # How long to wait for a Status 11 probe response before discarding
@@ -80,7 +338,7 @@ PROBE_TIMEOUT = int(os.environ.get("TASMOTA_PROBE_TIMEOUT", "15"))
 # ---------------------------------------------------------------------
 class _Shim:
     def __init__(self, name, **kw):
-        self._name = name
+        self._name  = name
         self._store = {}
 
         log.info("[DRY-RUN] Register D-Bus service: %s", name)
@@ -114,30 +372,47 @@ if VENUS_OS:
 else:
     VeDbusService = _Shim
 
+# Switch type constants
+TYPE_TOGGLE      = 1
+TYPE_THREE_STATE = 9
+
+STATUS_OFF       = 0x00
+STATUS_ON        = 0x09
+MODULE_CONNECTED = 0x100
+
+# ValidTypes bitmask: each bit position corresponds to the type enum value.
+# bit 1 (value 2)   = toggle (type 1)
+# bit 9 (value 512) = three-state (type 9)
+# FIX: three-state devices should only advertise bit 9, not bit 1 as well,
+# so the GUI doesn't offer "toggle" as a selectable type for three-state devices.
+VALID_TYPES_TOGGLE      = (1 << TYPE_TOGGLE)       # 0b0000000010 = 2
+VALID_TYPES_THREE_STATE = (1 << TYPE_THREE_STATE)  # 0b1000000000 = 512
+
 
 # =====================================================================
 # TasmotaDevice
 # =====================================================================
 class TasmotaDevice:
 
-    STATUS_OFF = 0x00
-    STATUS_ON = 0x09
-
-    MODULE_CONNECTED = 0x100
-
     def __init__(self, device_id: str, friendly_name: str, ip: str, channels: int = 1):
-        self.device_id = device_id
+        self.device_id     = device_id
         self.friendly_name = friendly_name
-        self.ip = ip
-        self.channels = channels
+        self.ip            = ip
+        self.channels      = channels
 
-        self._svc = None
-        self._lock = threading.Lock()
+        self._svc          = None
+        self._lock         = threading.Lock()
         self._mqtt_publish = None
+        self._relay_state: dict = {}  # tracks latest POWER key states for 3-state reverse lookup
 
         self._init_service()
 
     def _init_service(self):
+        three_state = CFG.is_three_state(self.device_id)
+        sw_type     = TYPE_THREE_STATE if three_state else TYPE_TOGGLE
+        # FIX: use separate bitmasks so three-state devices don't also show "toggle"
+        # as an option in the GUI type selector.
+        valid_types = VALID_TYPES_THREE_STATE if three_state else VALID_TYPES_TOGGLE
 
         svc_name = f"com.victronenergy.switch.tasmota_{self.device_id}"
 
@@ -146,18 +421,17 @@ class TasmotaDevice:
         if VENUS_OS and dbus:
             # Use a private D-Bus connection per service to avoid
             # path collision when multiple services register '/'.
-            private_bus = dbus.SystemBus(private=True)
-            kwargs["bus"] = private_bus
+            kwargs["bus"]      = dbus.SystemBus(private=True)
             kwargs["register"] = False  # add paths first, then register
 
         svc = VeDbusService(svc_name, **kwargs)
 
-        svc.add_path("/Mgmt/ProcessName", __file__)
-        svc.add_path("/Mgmt/ProcessVersion", "1.2.0")
-        svc.add_path("/Mgmt/Connection", f"MQTT {MQTT_HOST}")
+        svc.add_path("/Mgmt/ProcessName",    __file__)
+        svc.add_path("/Mgmt/ProcessVersion", "1.4.1")
+        svc.add_path("/Mgmt/Connection",     f"MQTT {MQTT_HOST}")
 
         svc.add_path("/ProductName", f"Tasmota ({self.friendly_name})")
-        svc.add_path("/ProductId", 0xB040)
+        svc.add_path("/ProductId",   0xB040)
 
         svc.add_path("/DeviceInstance", self._stable_instance())
 
@@ -166,80 +440,106 @@ class TasmotaDevice:
         svc.add_path("/FirmwareVersion", "")
         svc.add_path("/HardwareVersion", "")
 
-        svc.add_path("/Serial", self.device_id)
+        svc.add_path("/Serial",     self.device_id)
         svc.add_path("/CustomName", self.friendly_name)
 
-        svc.add_path("/State", self.MODULE_CONNECTED)
+        # Module-level state: initialise as Connected; will be cleared on offline.
+        svc.add_path("/State", MODULE_CONNECTED)
 
         for ch in range(self.channels):
 
-            label = ch
+            ch_name = f"CH{ch + 1}" if self.channels > 1 else "Relay"
 
-            svc.add_path(f"/Channel/{label}/Direction", 0)
+            svc.add_path(f"/Channel/{ch}/Direction", 0)
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/State",
+                f"/SwitchableOutput/{ch}/State",
                 0,
                 writeable=True,
                 onchangecallback=lambda path, val, c=ch: self._on_state_write(c, val),
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Status",
-                self.STATUS_OFF
+                f"/SwitchableOutput/{ch}/Status",
+                STATUS_OFF
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Name",
-                f"CH{ch + 1}" if self.channels > 1 else "Relay"
+                f"/SwitchableOutput/{ch}/Name",
+                ch_name
             )
 
-            ch_name = (
-                f"{self.friendly_name} CH{ch + 1}"
-                if self.channels > 1
-                else self.friendly_name
+            # ThreeState is writable on every device so a Node-RED flow or the GUI
+            # can promote a toggle device to three-state without editing the JSON.
+            # Writing 1 persists "three_state": true to the config and triggers a
+            # service re-init via the config-change callback.
+            svc.add_path(
+                f"/SwitchableOutput/{ch}/Settings/ThreeState",
+                1 if three_state else 0,
+                writeable=True,
+                onchangecallback=lambda _, val, c=ch: self._on_three_state_write(c, val),
             )
+
+            if three_state:
+                auto_mode = CFG.auto_mode(self.device_id)
+                svc.add_path(
+                    f"/SwitchableOutput/{ch}/Auto",
+                    auto_mode,
+                    writeable=True,
+                )
+                labels = CFG.labels(self.device_id)
+                # /Settings/Labels is a Venus OS GUI extension (not in the official spec)
+                # but recognised by gui-v2 for three-state switch label customisation.
+                # Writing a new JSON array here persists the labels to the config file.
+                svc.add_path(
+                    f"/SwitchableOutput/{ch}/Settings/Labels",
+                    json.dumps(labels),
+                    writeable=True,
+                    onchangecallback=lambda _, val, c=ch: self._on_labels_write(c, val),
+                )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/CustomName",
-                ch_name,
+                f"/SwitchableOutput/{ch}/Settings/CustomName",
+                f"{self.friendly_name} {ch_name}" if self.channels > 1 else self.friendly_name,
                 writeable=True
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/Type",
-                1
+                f"/SwitchableOutput/{ch}/Settings/Type",
+                sw_type,
+                writeable=True
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/ValidTypes",
-                0b0000000010
+                f"/SwitchableOutput/{ch}/Settings/ValidTypes",
+                valid_types
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/Function",
-                2
+                f"/SwitchableOutput/{ch}/Settings/Function",
+                2  # Manual
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/ValidFunctions",
+                f"/SwitchableOutput/{ch}/Settings/ValidFunctions",
                 0b0000100
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/Group",
-                "Tasmota",
-                writeable=True
+                f"/SwitchableOutput/{ch}/Settings/Group",
+                CFG.group(self.device_id),
+                writeable=True,
+                onchangecallback=lambda _, val, c=ch: self._on_group_write(c, val),
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/ShowUIControl",
+                f"/SwitchableOutput/{ch}/Settings/ShowUIControl",
                 1,
                 writeable=True
             )
 
             svc.add_path(
-                f"/SwitchableOutput/{label}/Settings/Adjustable",
+                f"/SwitchableOutput/{ch}/Settings/Adjustable",
                 1
             )
 
@@ -250,22 +550,27 @@ class TasmotaDevice:
         self._svc = svc
 
         log.info(
-            "Registered %s (%d channel(s))",
+            "Registered %s (%d channel(s), type=%s)",
             svc_name,
-            self.channels
+            self.channels,
+            "three-state" if three_state else "toggle"
         )
 
     def _stable_instance(self) -> int:
-        hex_part = re.sub(r"[^0-9A-Fa-f]", "", self.device_id[-6:]) or "1"
-        return int(hex_part, 16) % 2000
+        # Use a hash of the full device ID so instance numbers are stable and
+        # collision-free even for plain-text names like "tankpump" or "lounge".
+        # Range 0-9999 stays well within the Venus OS device instance limit.
+        import hashlib
+        return int(hashlib.md5(self.device_id.encode()).hexdigest(), 16) % 10000
 
     def set_online(self, online: bool):
 
         with self._lock:
             self._svc["/Connected"] = 1 if online else 0
-
-            if online:
-                self._svc["/State"] = self.MODULE_CONNECTED
+            # FIX: reflect module state accurately in both directions.
+            # When offline, set /State to invalid (None) so the GUI doesn't
+            # show "Connected" for a device that has gone away.
+            self._svc["/State"] = MODULE_CONNECTED if online else None
 
         log.info(
             "%s -> %s",
@@ -274,24 +579,61 @@ class TasmotaDevice:
         )
 
     def set_power(self, channel: int, state_str: str):
+        """Update D-Bus state from an incoming Tasmota POWER report.
 
-        ch_index = channel - 1
-
-        on = state_str.upper() == "ON"
+        For plain toggle devices: maps ON->1, OFF->0 as before.
+        For three-state devices: accumulates per-relay state then
+        reverse-looks up the matching state value (0/1/2) from the
+        relay_map.  All channels share the same logical three-state
+        value so all /SwitchableOutput/<ch>/State paths are updated.
+        """
+        power_key   = "POWER" if self.channels == 1 else f"POWER{channel}"
+        reverse_map = CFG.reverse_relay_map(self.device_id)
 
         with self._lock:
-            self._svc[f"/SwitchableOutput/{ch_index}/State"] = 1 if on else 0
-
-            self._svc[f"/SwitchableOutput/{ch_index}/Status"] = (
-                self.STATUS_ON if on else self.STATUS_OFF
-            )
-
-        log.debug(
-            "%s CH%d -> %s",
-            self.device_id,
-            channel,
-            state_str
-        )
+            if reverse_map:
+                # Three-state path: accumulate relay state and resolve
+                self._relay_state[power_key] = state_str.upper()
+                observed  = frozenset(self._relay_state.items())
+                state_val = reverse_map.get(observed)
+                if state_val is None:
+                    # Partial update - not all relays reported yet; skip
+                    log.debug(
+                        "%s waiting for more relay updates (%s)",
+                        self.device_id,
+                        self._relay_state
+                    )
+                    return
+                # Don't overwrite a higher explicitly-set state (e.g. Auto=2) with a
+                # lower inferred one (e.g. On=1) when the relay combination is ambiguous.
+                # 'Auto' can only be cleared by an explicit write, not by a relay report.
+                current = self._svc[f"/SwitchableOutput/0/State"]
+                if current is not None and current > state_val:
+                    log.debug(
+                        "%s keeping explicit state %s, ignoring inferred %s from relay",
+                        self.device_id, current, state_val
+                    )
+                    return
+                on = state_val > 0
+                log.debug(
+                    "%s three-state relay=%s -> state %d",
+                    self.device_id, self._relay_state, state_val
+                )
+                for ch in range(self.channels):
+                    self._svc[f"/SwitchableOutput/{ch}/State"]  = state_val
+                    self._svc[f"/SwitchableOutput/{ch}/Status"] = STATUS_ON if on else STATUS_OFF
+            else:
+                # Plain toggle path
+                ch_index = channel - 1
+                on       = state_str.upper() == "ON"
+                self._svc[f"/SwitchableOutput/{ch_index}/State"]  = 1 if on else 0
+                self._svc[f"/SwitchableOutput/{ch_index}/Status"] = STATUS_ON if on else STATUS_OFF
+                log.debug(
+                    "%s CH%d -> %s",
+                    self.device_id,
+                    channel,
+                    state_str
+                )
 
     def set_firmware(self, version: str):
 
@@ -305,27 +647,85 @@ class TasmotaDevice:
             self._svc["/CustomName"] = friendly_name
 
     def _on_state_write(self, ch_index: int, new_value):
+        """Called by Venus OS when the user writes to /SwitchableOutput/x/State.
 
-        cmd = "ON" if new_value else "OFF"
+        Three-state device (type 9): new_value is 0 (Off), 1 (On) or 2 (Auto).
+        Each state maps to a set of relay commands via the relay_map in the config.
 
-        channel = ch_index + 1
+        Plain toggle device (type 1): new_value is 0 or 1.
 
-        power_key = (
-            "POWER"
-            if self.channels == 1
-            else f"POWER{channel}"
-        )
+        Must return True to accept the write, False to reject it.
+        Returning None (implicit) causes velib_python to silently reject the write,
+        so all GUI interactions would appear to do nothing.
+        """
+        relay_map = CFG.relay_map(self.device_id)
 
-        topic = f"cmnd/{self.device_id}/{power_key}"
+        if relay_map:
+            # Three-state: look up relay commands for this state value (0/1/2)
+            state_key = str(int(new_value))
+            commands  = relay_map.get(state_key)
+            if commands:
+                label      = CFG.labels(self.device_id)
+                state_name = label[int(new_value)] if int(new_value) < len(label) else state_key
+                log.info("GUI->MQTT state=%s (%s) %s", state_key, state_name, commands)
+                for power_key, cmd in commands.items():
+                    topic = f"cmnd/{self.device_id}/{power_key}"
+                    if self._mqtt_publish:
+                        self._mqtt_publish(topic, cmd)
+                    log.debug("  publish %s = %s", topic, cmd)
+            else:
+                log.warning("%s: no relay_map entry for state %s", self.device_id, state_key)
+        else:
+            # Plain toggle
+            cmd       = "ON" if new_value else "OFF"
+            power_key = "POWER" if self.channels == 1 else f"POWER{ch_index + 1}"
+            topic     = f"cmnd/{self.device_id}/{power_key}"
+            if self._mqtt_publish:
+                self._mqtt_publish(topic, cmd)
+            log.info("GUI->MQTT %s %s", topic, cmd)
 
-        if self._mqtt_publish:
-            self._mqtt_publish(topic, cmd)
+        # FIX: return True so velib_python accepts the write and updates /State
+        # on the D-Bus. Without this the GUI toggle appears to do nothing because
+        # velib_python interprets a falsy return value as "reject the write".
+        return True
 
-            log.info(
-                "GUI->MQTT %s %s",
-                topic,
-                cmd
-            )
+    def _on_three_state_write(self, _: int, new_value):
+        """Called when the GUI writes to /Settings/ThreeState.
+
+        Persists the change to the config file and triggers a service re-init
+        via the config-change callback so the device picks up the new type
+        (toggle <-> three-state) without restarting the script.
+        """
+        enable = bool(new_value)
+        log.info("%s: ThreeState -> %s (via D-Bus write)", self.device_id, enable)
+        CFG.update_device_field(self.device_id, "three_state", enable, notify=True)
+        return True
+
+    def _on_group_write(self, _: int, new_value):
+        """Called when the GUI writes to /Settings/Group. Persists to config."""
+        if not isinstance(new_value, str) or not new_value.strip():
+            return False
+        log.info("%s: Group -> %r (via D-Bus write)", self.device_id, new_value)
+        CFG.update_device_field(self.device_id, "group", new_value, notify=False)
+        return True
+
+    def _on_labels_write(self, _: int, new_value):
+        """Called when the GUI writes to /Settings/Labels.
+
+        Expects a JSON-encoded list of three strings, e.g. '["Off","On","Auto"]'.
+        Persists to the config file without triggering a full re-init.
+        """
+        try:
+            labels = json.loads(new_value) if isinstance(new_value, str) else list(new_value)
+            if not isinstance(labels, list) or len(labels) != 3:
+                log.warning("%s: Labels must be a JSON array of 3 strings", self.device_id)
+                return False
+        except (json.JSONDecodeError, TypeError, ValueError):
+            log.warning("%s: invalid Labels value: %r", self.device_id, new_value)
+            return False
+        log.info("%s: Labels -> %s (via D-Bus write)", self.device_id, labels)
+        CFG.update_device_field(self.device_id, "labels", labels, notify=False)
+        return True
 
     def inject_mqtt_publish(self, fn):
         self._mqtt_publish = fn
@@ -349,6 +749,31 @@ class TasmotaDiscovery:
         self._pending: dict[str, threading.Timer] = {}
         self._pending_lock = threading.Lock()
 
+        CFG.register_callback(self._on_config_change)
+
+    # -----------------------------------------------------------------
+    # Config change handler
+    # -----------------------------------------------------------------
+    def _on_config_change(self, added: set, removed: set, modified: set):
+        """Re-init D-Bus service for any registered device whose config changed.
+
+        Runs in a background thread so this is safe to call from within a
+        D-Bus write callback (e.g. ThreeState toggle from the GUI).
+        """
+        reinit = (added | modified | removed) & set(self._devices)
+        if not reinit:
+            return
+        log.info("Config change - re-initing: %s", reinit)
+
+        def _do():
+            # Snapshot device references without holding the lock during re-init.
+            with self._lock:
+                devs = [self._devices[d] for d in reinit if d in self._devices]
+            for dev in devs:
+                dev._init_service()
+
+        threading.Thread(target=_do, daemon=True, name="config-reinit").start()
+
     # -----------------------------------------------------------------
     # MQTT setup
     # -----------------------------------------------------------------
@@ -363,9 +788,9 @@ class TasmotaDiscovery:
         if MQTT_USER:
             self._mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        self._mqttc.on_connect = self._on_connect
+        self._mqttc.on_connect    = self._on_connect
         self._mqttc.on_disconnect = self._on_disconnect
-        self._mqttc.on_message = self._on_message
+        self._mqttc.on_message    = self._on_message
 
         self._mqttc.connect_async(
             MQTT_HOST,
@@ -445,7 +870,7 @@ class TasmotaDiscovery:
             return
 
         device_id = parts[1]
-        subtopic = parts[-1]
+        subtopic  = parts[-1]
 
         # -------------------------------------------------------------
         # LWT
@@ -455,7 +880,7 @@ class TasmotaDiscovery:
             online = payload.lower() == "online"
 
             if online:
-                # Don't register yet — probe first to confirm it has relays.
+                # Don't register yet  -  probe first to confirm it has relays.
                 self._probe_device(device_id)
 
             else:
@@ -471,23 +896,23 @@ class TasmotaDiscovery:
             return
 
         # -------------------------------------------------------------
-        # STATUS11 — probe response
+        # STATUS11  -  probe response
         # Only register the device if StatusSTS contains a POWER key.
         # -------------------------------------------------------------
         if subtopic == "STATUS11":
 
             # Only act on devices we're actively probing.
             if not self._is_pending(device_id):
-                # Already registered — ignore (can arrive during normal polls).
+                # Already registered  -  ignore (can arrive during normal polls).
                 return
 
             try:
                 data = json.loads(payload)
-                sts = data.get("StatusSTS", {})
+                sts  = data.get("StatusSTS", {})
 
             except (json.JSONDecodeError, TypeError):
                 log.warning(
-                    "%s STATUS11 parse error — treating as non-switch",
+                    "%s STATUS11 parse error  -  treating as non-switch",
                     device_id
                 )
                 self._cancel_probe(device_id)
@@ -500,7 +925,7 @@ class TasmotaDiscovery:
 
             if not has_relay:
                 log.info(
-                    "%s has no POWER keys in STATUS11 — sensor device, skipping",
+                    "%s has no POWER keys in STATUS11  -  sensor device, skipping",
                     device_id
                 )
                 self._cancel_probe(device_id)
@@ -538,31 +963,28 @@ class TasmotaDiscovery:
             except json.JSONDecodeError:
                 return
 
-            fname = info.get("FriendlyName1", device_id)
-            version = info.get("Version", "")
-            ip = info.get("IPAddress", "unknown")
-
             # Only update already-registered devices from INFO1.
             # If still pending, the device has not been confirmed as a switch yet.
             dev = self._get(device_id)
 
             if dev:
-                dev.set_firmware(version)
+                dev.set_firmware(info.get("Version", ""))
                 dev.set_online(True)
 
+                fname = info.get("FriendlyName1", "")
                 if fname and fname != device_id:
                     dev.update_name(fname)
 
             return
 
         # -------------------------------------------------------------
-        # INFO3 — carries IP address on modern Tasmota firmware
+        # INFO3  -  carries IP address on modern Tasmota firmware
         # -------------------------------------------------------------
         if subtopic == "INFO3":
 
             try:
                 info = json.loads(payload)
-                ip = info.get("IPAddress", "")
+                ip   = info.get("IPAddress", "")
 
             except (json.JSONDecodeError, TypeError):
                 return
@@ -576,7 +998,7 @@ class TasmotaDiscovery:
             return
 
         # -------------------------------------------------------------
-        # STATUS (Status 0 response — friendly name + channel count)
+        # STATUS (Status 0 response  -  friendly name + channel count)
         # -------------------------------------------------------------
         if subtopic == "STATUS":
 
@@ -590,8 +1012,7 @@ class TasmotaDiscovery:
                     [device_id]
                 )
 
-                fname = names[0] if names else device_id
-
+                fname    = names[0] if names else device_id
                 channels = max(1, len(names))
 
             except (json.JSONDecodeError, TypeError):
@@ -652,7 +1073,7 @@ class TasmotaDiscovery:
         with self._pending_lock:
 
             if device_id in self._pending:
-                # Already probing — reset the timeout.
+                # Already probing  -  reset the timeout.
                 self._pending[device_id].cancel()
 
             # Register a timeout that discards the probe if no response.
@@ -671,7 +1092,7 @@ class TasmotaDiscovery:
         self._mqtt_publish(f"cmnd/{device_id}/Status", "11")
 
     def _probe_timeout(self, device_id: str):
-        """Called when a probed device never replied — discard it."""
+        """Called when a probed device never replied  -  discard it."""
 
         with self._pending_lock:
 
@@ -681,7 +1102,7 @@ class TasmotaDiscovery:
             del self._pending[device_id]
 
         log.info(
-            "%s probe timed out after %ds — no STATUS11 response, ignoring",
+            "%s probe timed out after %ds  -  no STATUS11 response, ignoring",
             device_id,
             PROBE_TIMEOUT
         )
@@ -761,8 +1182,10 @@ class TasmotaDiscovery:
 
                 self._devices[device_id] = dev
 
+                CFG.register_device(device_id, friendly_name, ip, channels)
+
             else:
-                # Device already registered — update name only if we now
+                # Device already registered  -  update name only if we now
                 # have a real name and previously only had the device_id
                 # placeholder. Channel count changes are handled in STATUS.
                 dev = self._devices[device_id]
@@ -772,6 +1195,7 @@ class TasmotaDiscovery:
                     and dev.friendly_name == device_id
                 ):
                     dev.update_name(friendly_name)
+                    CFG.register_device(device_id, friendly_name, ip, dev.channels)
 
         return self._devices[device_id]
 
@@ -784,13 +1208,12 @@ class TasmotaDiscovery:
     # Polling
     # -----------------------------------------------------------------
     def _poll_all(self):
-        """Send a Status 11 probe to all already-registered devices."""
+        """Send a power query to all already-registered devices."""
 
         with self._lock:
             ids = list(self._devices.keys())
 
         for did in ids:
-            # For registered devices we poll power state directly.
             self._mqttc.publish(
                 f"cmnd/{did}/Power",
                 ""
@@ -852,7 +1275,7 @@ class TasmotaDiscovery:
             )
 
             log.info(
-                "mDNS found: %s @ %s — probing",
+                "mDNS found: %s @ %s  -  probing",
                 device_id,
                 ip
             )
@@ -878,6 +1301,8 @@ class TasmotaDiscovery:
 
         if VENUS_OS and DBusGMainLoop:
             DBusGMainLoop(set_as_default=True)
+
+        CFG.start_watcher()
 
         self.start_mqtt()
 
