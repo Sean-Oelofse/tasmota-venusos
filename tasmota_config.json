@@ -1,0 +1,42 @@
+{
+  "devices": {
+    "Shelly": {
+      "_name": "Shelly",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": true
+    },
+    "borehole_0": {
+      "_name": "borehole_0",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": true
+    },
+    "lounge": {
+      "_name": "lounge",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": false,
+      "group": "Lounge"
+    },
+    "outside-lights": {
+      "_name": "outside-lights",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": false
+    },
+    "pow316": {
+      "_name": "pow316",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": true
+    },
+    "tankpump": {
+      "_name": "tankpump",
+      "_ip": "unknown",
+      "_channels": 1,
+      "three_state": false,
+      "custom_name_0": "Tank Pump"
+    }
+  }
+}
