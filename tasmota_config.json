@@ -1,42 +1,57 @@
 {
   "devices": {
-    "Shelly": {
-      "_name": "Shelly",
+    "lounge": {
+      "_name": "lounge",
       "_ip": "unknown",
       "_channels": 1,
-      "three_state": true
+      "instance": 0,
+      "three_state": false,
+      "custom_name_0": "Fan",
+      "group": "Lounge"
     },
     "borehole_0": {
       "_name": "borehole_0",
       "_ip": "unknown",
       "_channels": 1,
-      "three_state": true
-    },
-    "lounge": {
-      "_name": "lounge",
-      "_ip": "unknown",
-      "_channels": 1,
-      "three_state": false,
-      "group": "Lounge"
+      "instance": 1,
+      "three_state": true,
+      "custom_name_0": "Borehole",
+      "group": "Switches"
     },
     "outside-lights": {
       "_name": "outside-lights",
       "_ip": "unknown",
       "_channels": 1,
-      "three_state": false
-    },
-    "pow316": {
-      "_name": "pow316",
-      "_ip": "unknown",
-      "_channels": 1,
-      "three_state": true
+      "instance": 2,
+      "three_state": false,
+      "group": "Z Security"
     },
     "tankpump": {
       "_name": "tankpump",
       "_ip": "unknown",
       "_channels": 1,
+      "instance": 3,
       "three_state": false,
-      "custom_name_0": "Tank Pump"
+      "custom_name_0": "Tank Pump",
+      "group": "Switches"
+    },
+    "pow316": {
+      "_name": "pow316",
+      "_ip": "unknown",
+      "_channels": 1,
+      "instance": 4,
+      "three_state": true,
+      "custom_name_0": "Tumble Dryer",
+      "group": "Switches"
+    },
+    "Shelly": {
+      "_name": "Shelly",
+      "_ip": "unknown",
+      "_channels": 1,
+      "instance": 5,
+      "three_state": true,
+      "group": "Switches",
+      "custom_name_0": "Humidifier"
     }
   }
 }
