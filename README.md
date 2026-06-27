@@ -2,7 +2,8 @@
 Python integration for Tasmota that allows switch panel integration.
 
 
-<img width="338" height="440" alt="image" src="https://github.com/user-attachments/assets/e35ea3f1-bfd4-4bc2-b525-076ef457cca3" /> <img width="649" height="338" alt="image" src="https://github.com/user-attachments/assets/275f0fa4-e928-4263-93cf-2ee5bde5c01b" />
+<img width="342" height="444" alt="image" src="https://github.com/user-attachments/assets/08aaab9e-6d9b-43e6-b113-251e101478b6" />
+<img width="649" height="338" alt="image" src="https://github.com/user-attachments/assets/275f0fa4-e928-4263-93cf-2ee5bde5c01b" />
 
 
 
@@ -36,3 +37,11 @@ Useful commands:
     cp tasmota.py /opt/victronenergy/tasmota-discovery/
     
     ./install_tasmota_service.sh --uninstall
+__________________________________________________________________________
+Enabling three state mode:
+    
+    cd /data && nano tasmota_config.json
+Simply change three_state to true
+
+<img width="285" height="701" alt="image" src="https://github.com/user-attachments/assets/a89218e7-6e2a-4ae8-9213-9a2c3d605f31" />
+
