@@ -445,6 +445,17 @@ class TasmotaDevice:
 
         svc_name = f"com.victronenergy.switch.tasmota_{self.device_id}"
 
+        # Preserve the live switch position across re-init (e.g. toggling
+        # Auto/Manual or three_state) so the relay's actual state isn't
+        # reset to Off just because the config changed.
+        prev_svc    = self._svc
+        prev_state  = {}
+        prev_status = {}
+        if prev_svc is not None:
+            for ch in range(self.channels):
+                prev_state[ch]  = prev_svc[f"/SwitchableOutput/{ch}/State"]
+                prev_status[ch] = prev_svc[f"/SwitchableOutput/{ch}/Status"]
+
         kwargs = {}
 
         if VENUS_OS and dbus:
