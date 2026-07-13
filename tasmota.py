@@ -61,7 +61,22 @@ class ConfigManager:
             }
           }
         }
+
+        # Energy monitoring device (e.g. Sonoff POW/S31). Auto-detected from
+        # the tele/<topic>/SENSOR "ENERGY" block and registered as a Venus OS
+        # AC energy meter; override with "energy_meter" / "role" / "phases".
+        {
+          "devices": {
+            "sonoff_pow_1": {
+              "energy_meter": true,
+              "role": "acload",
+              "phases": 1
+            }
+          }
+        }
     """
+
+    ENERGY_ROLES = ("grid", "acload", "pvinverter", "genset")
 
     def __init__(self, path: str):
         self.path             = path
@@ -190,6 +205,34 @@ class ConfigManager:
         with self._lock:
             return self._devices.get(device_id, {}).get("group", "Tasmota")
 
+    def custom_name(self, device_id: str, channel: int, fallback: str) -> str:
+        """Return the persisted custom name for a channel, or fallback if not set."""
+        key = f"custom_name_{channel}"
+        with self._lock:
+            return self._devices.get(device_id, {}).get(key, fallback)
+
+    def assign_instance(self, device_id: str) -> int:
+        """Return this device's instance number, assigning the next sequential one if needed.
+
+        Assignment is in-memory only; the number is persisted when register_device
+        writes the stub to disk.  On subsequent startups the value is read back
+        from the config file, so the same device always gets the same number.
+        """
+        with self._lock:
+            val = self._devices.get(device_id, {}).get("instance")
+            if val is not None:
+                return int(val)
+            used = {
+                int(d["instance"])
+                for d in self._devices.values()
+                if d.get("instance") is not None
+            }
+            n = 0
+            while n in used:
+                n += 1
+            self._devices.setdefault(device_id, {})["instance"] = n
+            return n
+
     def register_device(self, device_id: str, friendly_name: str, ip: str, channels: int):
         """Add a discovered device to the config file if not already present.
 
@@ -213,6 +256,7 @@ class ConfigManager:
             "_name":      friendly_name,
             "_ip":        ip,
             "_channels":  channels,
+            "instance":   self.assign_instance(device_id),
             # Set to true (or write 1 to /Settings/ThreeState on D-Bus) to make this
             # a three-state switch (Off / On / Auto) for a single-relay device.
             "three_state": False,
@@ -238,6 +282,77 @@ class ConfigManager:
             # Update mtime so the watcher doesn't re-fire for this write
             with self._lock:
                 self._devices.setdefault(device_id, devices[device_id])
+                self._mtime = os.path.getmtime(self.path)
+        except Exception as exc:
+            log.warning("Could not write config file: %s", exc)
+
+    def energy_meter_enabled(self, device_id: str) -> Optional[bool]:
+        """Return True/False if 'energy_meter' is explicitly set, else None.
+
+        None means auto-detect: register as an energy meter the first time
+        a tele/SENSOR ENERGY block is seen for this device.
+        """
+        with self._lock:
+            val = self._devices.get(device_id, {}).get("energy_meter")
+        return None if val is None else bool(val)
+
+    def energy_role(self, device_id: str) -> str:
+        """Return the configured Venus OS role (grid/acload/pvinverter/genset)
+        for this device's energy meter, defaulting to 'acload'.
+        """
+        with self._lock:
+            role = self._devices.get(device_id, {}).get("role", "acload")
+        if role not in self.ENERGY_ROLES:
+            log.warning("%s: unknown energy meter role %r, defaulting to acload", device_id, role)
+            return "acload"
+        return role
+
+    def energy_phases(self, device_id: str) -> int:
+        """Return the configured phase count (1 or 3) for this device's energy meter."""
+        with self._lock:
+            phases = self._devices.get(device_id, {}).get("phases", 1)
+        try:
+            phases = int(phases)
+        except (TypeError, ValueError):
+            phases = 1
+        return phases if phases in (1, 3) else 1
+
+    def register_energy_meter(self, device_id: str, friendly_name: str, ip: str):
+        """Add a discovered energy-meter device to the config file if not
+        already present, or seed role/phases defaults onto an existing entry
+        (e.g. one already registered as a switch).  Never overwrites existing
+        fields.
+        """
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    raw = json.load(f)
+            except Exception:
+                raw = {}
+        else:
+            raw = {}
+
+        devices = raw.setdefault("devices", {})
+        entry = devices.get(device_id)
+        if entry is None:
+            entry = {
+                "_name":     friendly_name,
+                "_ip":       ip,
+                "instance":  self.assign_instance(device_id),
+            }
+            devices[device_id] = entry
+
+        entry.setdefault("role", "acload")
+        entry.setdefault("phases", 1)
+        # Optional: force on/off instead of auto-detecting from tele/SENSOR:
+        #   "energy_meter": true
+
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+            log.info("Added/updated energy meter %s in config file (%s)", device_id, self.path)
+            with self._lock:
+                self._devices[device_id] = entry
                 self._mtime = os.path.getmtime(self.path)
         except Exception as exc:
             log.warning("Could not write config file: %s", exc)
@@ -388,6 +503,9 @@ MODULE_CONNECTED = 0x100
 VALID_TYPES_TOGGLE      = (1 << TYPE_TOGGLE)       # 0b0000000010 = 2
 VALID_TYPES_THREE_STATE = (1 << TYPE_THREE_STATE)  # 0b1000000000 = 512
 
+# ProductId for Tasmota-based energy meters (arbitrary, community integration)
+PRODUCT_ID_METER = 0xB041
+
 
 # =====================================================================
 # TasmotaDevice
@@ -415,6 +533,17 @@ class TasmotaDevice:
         valid_types = VALID_TYPES_THREE_STATE if three_state else VALID_TYPES_TOGGLE
 
         svc_name = f"com.victronenergy.switch.tasmota_{self.device_id}"
+
+        # Preserve the live switch position across re-init (e.g. toggling
+        # Auto/Manual or three_state) so the relay's actual state isn't
+        # reset to Off just because the config changed.
+        prev_svc    = self._svc
+        prev_state  = {}
+        prev_status = {}
+        if prev_svc is not None:
+            for ch in range(self.channels):
+                prev_state[ch]  = prev_svc[f"/SwitchableOutput/{ch}/State"]
+                prev_status[ch] = prev_svc[f"/SwitchableOutput/{ch}/Status"]
 
         kwargs = {}
 
@@ -498,10 +627,12 @@ class TasmotaDevice:
                     onchangecallback=lambda _, val, c=ch: self._on_labels_write(c, val),
                 )
 
+            default_name = f"{self.friendly_name} {ch_name}" if self.channels > 1 else self.friendly_name
             svc.add_path(
                 f"/SwitchableOutput/{ch}/Settings/CustomName",
-                f"{self.friendly_name} {ch_name}" if self.channels > 1 else self.friendly_name,
-                writeable=True
+                CFG.custom_name(self.device_id, ch, default_name),
+                writeable=True,
+                onchangecallback=lambda _, val, c=ch: self._on_custom_name_write(c, val),
             )
 
             svc.add_path(
@@ -557,11 +688,7 @@ class TasmotaDevice:
         )
 
     def _stable_instance(self) -> int:
-        # Use a hash of the full device ID so instance numbers are stable and
-        # collision-free even for plain-text names like "tankpump" or "lounge".
-        # Range 0-9999 stays well within the Venus OS device instance limit.
-        import hashlib
-        return int(hashlib.md5(self.device_id.encode()).hexdigest(), 16) % 10000
+        return CFG.assign_instance(self.device_id)
 
     def set_online(self, online: bool):
 
@@ -701,6 +828,14 @@ class TasmotaDevice:
         CFG.update_device_field(self.device_id, "three_state", enable, notify=True)
         return True
 
+    def _on_custom_name_write(self, ch_index: int, new_value):
+        """Called when the GUI writes to /Settings/CustomName. Persists to config."""
+        if not isinstance(new_value, str) or not new_value.strip():
+            return False
+        log.info("%s CH%d: CustomName -> %r (via D-Bus write)", self.device_id, ch_index, new_value)
+        CFG.update_device_field(self.device_id, f"custom_name_{ch_index}", new_value, notify=False)
+        return True
+
     def _on_group_write(self, _: int, new_value):
         """Called when the GUI writes to /Settings/Group. Persists to config."""
         if not isinstance(new_value, str) or not new_value.strip():
@@ -732,6 +867,149 @@ class TasmotaDevice:
 
 
 # =====================================================================
+# TasmotaEnergyMeter
+# =====================================================================
+class TasmotaEnergyMeter:
+    """A Tasmota device with energy monitoring, registered as a Venus OS
+    AC energy meter (role/phases configurable per device - see ConfigManager).
+    """
+
+    def __init__(self, device_id: str, friendly_name: str):
+        self.device_id     = device_id
+        self.friendly_name = friendly_name
+
+        self._svc     = None
+        self._bus     = None
+        self._lock    = threading.Lock()
+        self._phases  = 1
+
+        self._init_service()
+
+    def _init_service(self):
+        role   = CFG.energy_role(self.device_id)
+        phases = CFG.energy_phases(self.device_id)
+
+        svc_name = f"com.victronenergy.{role}.tasmota_{self.device_id}"
+
+        # The service name embeds the role, so a role change means a new
+        # D-Bus name - release the previous private bus connection once the
+        # new one is registered, rather than leaving it registered under a
+        # stale name.
+        prev_bus = self._bus
+
+        kwargs = {}
+
+        if VENUS_OS and dbus:
+            bus = dbus.SystemBus(private=True)
+            kwargs["bus"]      = bus
+            kwargs["register"] = False
+            self._bus = bus
+        else:
+            self._bus = None
+
+        svc = VeDbusService(svc_name, **kwargs)
+
+        svc.add_path("/Mgmt/ProcessName",    __file__)
+        svc.add_path("/Mgmt/ProcessVersion", "1.4.1")
+        svc.add_path("/Mgmt/Connection",     f"MQTT {MQTT_HOST}")
+
+        svc.add_path("/ProductName", f"Tasmota energy meter ({self.friendly_name})")
+        svc.add_path("/ProductId",   PRODUCT_ID_METER)
+
+        svc.add_path("/DeviceInstance", CFG.assign_instance(self.device_id))
+
+        svc.add_path("/Connected", 0)
+
+        svc.add_path("/FirmwareVersion", "")
+        svc.add_path("/HardwareVersion", "")
+
+        svc.add_path("/Serial",     self.device_id)
+        svc.add_path("/CustomName", self.friendly_name)
+
+        svc.add_path("/Ac/Power",          0.0)
+        svc.add_path("/Ac/Energy/Forward", 0.0)
+        svc.add_path("/Ac/Energy/Reverse", 0.0)
+
+        for n in range(1, phases + 1):
+            svc.add_path(f"/Ac/L{n}/Voltage", 0.0)
+            svc.add_path(f"/Ac/L{n}/Current", 0.0)
+            svc.add_path(f"/Ac/L{n}/Power",   0.0)
+
+        if VENUS_OS and dbus and hasattr(svc, "register"):
+            svc.register()
+
+        if prev_bus is not None and prev_bus is not self._bus:
+            try:
+                prev_bus.close()
+            except Exception:
+                pass
+
+        self._svc    = svc
+        self._phases = phases
+
+        log.info(
+            "Registered %s (role=%s, %d phase(s))",
+            svc_name, role, phases
+        )
+
+    def set_online(self, online: bool):
+        with self._lock:
+            self._svc["/Connected"] = 1 if online else 0
+        log.info("%s (meter) -> %s", self.device_id, "ONLINE" if online else "OFFLINE")
+
+    def set_firmware(self, version: str):
+        with self._lock:
+            self._svc["/FirmwareVersion"] = version
+
+    def update_name(self, friendly_name: str):
+        with self._lock:
+            self.friendly_name = friendly_name
+            self._svc["/CustomName"] = friendly_name
+
+    @staticmethod
+    def _phase_value(val, idx: int) -> float:
+        """Tasmota reports a scalar for single-phase energy monitoring, and a
+        list (one entry per phase) when "Energy Phases" > 1 is configured.
+        """
+        if isinstance(val, list):
+            return float(val[idx]) if idx < len(val) else 0.0
+        return float(val) if idx == 0 else 0.0
+
+    def set_reading(self, energy: dict):
+        """Update D-Bus paths from a Tasmota SENSOR/STATUS8 ENERGY block."""
+        power   = energy.get("Power", 0)
+        voltage = energy.get("Voltage", 0)
+        current = energy.get("Current", 0)
+        total   = energy.get("Total", 0)
+
+        with self._lock:
+            total_power = 0.0
+            for idx in range(self._phases):
+                p = self._phase_value(power, idx)
+                total_power += p
+                self._svc[f"/Ac/L{idx + 1}/Voltage"] = self._phase_value(voltage, idx)
+                self._svc[f"/Ac/L{idx + 1}/Current"] = self._phase_value(current, idx)
+                self._svc[f"/Ac/L{idx + 1}/Power"]   = p
+
+            self._svc["/Ac/Power"] = total_power
+            self._svc["/Ac/Energy/Forward"] = (
+                float(sum(total)) if isinstance(total, list) else float(total)
+            )
+
+        log.debug("%s (meter) reading: %s", self.device_id, energy)
+
+    def shutdown(self):
+        """Release the D-Bus connection so the service disappears cleanly,
+        e.g. when the device is disabled or reconfigured with a new role.
+        """
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+
+
+# =====================================================================
 # TasmotaDiscovery
 # =====================================================================
 class TasmotaDiscovery:
@@ -739,6 +1017,7 @@ class TasmotaDiscovery:
     def __init__(self):
 
         self._devices: dict[str, TasmotaDevice] = {}
+        self._meters: dict[str, TasmotaEnergyMeter] = {}
         self._lock = threading.Lock()
         self._mqttc = None
 
@@ -760,17 +1039,30 @@ class TasmotaDiscovery:
         Runs in a background thread so this is safe to call from within a
         D-Bus write callback (e.g. ThreeState toggle from the GUI).
         """
-        reinit = (added | modified | removed) & set(self._devices)
-        if not reinit:
+        changed        = added | modified | removed
+        reinit_devices = changed & set(self._devices)
+        reinit_meters  = changed & set(self._meters)
+        if not reinit_devices and not reinit_meters:
             return
-        log.info("Config change - re-initing: %s", reinit)
+        log.info("Config change - re-initing: devices=%s meters=%s", reinit_devices, reinit_meters)
 
         def _do():
-            # Snapshot device references without holding the lock during re-init.
+            # Snapshot references without holding the lock during re-init.
             with self._lock:
-                devs = [self._devices[d] for d in reinit if d in self._devices]
+                devs   = [self._devices[d] for d in reinit_devices if d in self._devices]
+                meters = [(d, self._meters[d]) for d in reinit_meters if d in self._meters]
+
             for dev in devs:
                 dev._init_service()
+
+            for device_id, meter in meters:
+                if CFG.energy_meter_enabled(device_id) is False:
+                    log.info("%s: energy meter disabled via config, shutting down", device_id)
+                    meter.shutdown()
+                    with self._lock:
+                        self._meters.pop(device_id, None)
+                else:
+                    meter._init_service()
 
         threading.Thread(target=_do, daemon=True, name="config-reinit").start()
 
@@ -823,7 +1115,9 @@ class TasmotaDiscovery:
             "tele/+/LWT",
             "tele/+/INFO1",
             "tele/+/INFO3",         # carries IP address on modern firmware
+            "tele/+/SENSOR",        # periodic telemetry: carries ENERGY block if metered
             "stat/+/STATUS",
+            "stat/+/STATUS8",       # probe response: carries ENERGY block if metered
             "stat/+/STATUS11",      # probe response: contains POWER keys if switch
             "stat/+/POWER",
             "stat/+/POWER1",
@@ -883,6 +1177,11 @@ class TasmotaDiscovery:
                 # Don't register yet  -  probe first to confirm it has relays.
                 self._probe_device(device_id)
 
+                # Independently, ask for an energy reading in case this
+                # device has power monitoring (unless explicitly disabled).
+                if CFG.energy_meter_enabled(device_id) is not False:
+                    self._mqtt_publish(f"cmnd/{device_id}/Status", "8")
+
             else:
                 # Device going offline: mark existing registered device offline.
                 # If still pending (probe not yet answered), cancel and discard.
@@ -892,6 +1191,11 @@ class TasmotaDiscovery:
 
                 if dev:
                     dev.set_online(False)
+
+                meter = self._get_meter(device_id)
+
+                if meter:
+                    meter.set_online(False)
 
             return
 
@@ -953,6 +1257,27 @@ class TasmotaDiscovery:
             return
 
         # -------------------------------------------------------------
+        # STATUS8  -  probe response, and SENSOR  -  periodic telemetry.
+        # Both carry an ENERGY block if the device has power monitoring.
+        # -------------------------------------------------------------
+        if subtopic in ("STATUS8", "SENSOR"):
+
+            try:
+                data = json.loads(payload)
+                energy = (
+                    data.get("StatusSNS", {}).get("ENERGY")
+                    if subtopic == "STATUS8"
+                    else data.get("ENERGY")
+                )
+
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                return
+
+            self._handle_energy_reading(device_id, energy)
+
+            return
+
+        # -------------------------------------------------------------
         # INFO1
         # -------------------------------------------------------------
         if subtopic == "INFO1":
@@ -974,6 +1299,16 @@ class TasmotaDiscovery:
                 fname = info.get("FriendlyName1", "")
                 if fname and fname != device_id:
                     dev.update_name(fname)
+
+            meter = self._get_meter(device_id)
+
+            if meter:
+                meter.set_firmware(info.get("Version", ""))
+                meter.set_online(True)
+
+                fname = info.get("FriendlyName1", "")
+                if fname and fname != device_id:
+                    meter.update_name(fname)
 
             return
 
@@ -1039,6 +1374,14 @@ class TasmotaDiscovery:
                     )
                     dev.channels = channels
                     dev._init_service()
+
+            meter = self._get_meter(device_id)
+
+            if meter:
+                if fname and fname != device_id:
+                    meter.update_name(fname)
+
+                meter.set_online(True)
 
             return
 
@@ -1203,6 +1546,63 @@ class TasmotaDiscovery:
 
         with self._lock:
             return self._devices.get(device_id)
+
+    # -----------------------------------------------------------------
+    # Energy meter registry
+    # -----------------------------------------------------------------
+    def _ensure_energy_meter(
+        self,
+        device_id: str,
+        friendly_name: str,
+        ip: str
+    ) -> TasmotaEnergyMeter:
+
+        with self._lock:
+
+            if device_id not in self._meters:
+
+                log.info(
+                    "New energy meter: %s name=%r ip=%s",
+                    device_id,
+                    friendly_name,
+                    ip
+                )
+
+                meter = TasmotaEnergyMeter(device_id, friendly_name)
+
+                self._meters[device_id] = meter
+
+                CFG.register_energy_meter(device_id, friendly_name, ip)
+
+            else:
+                meter = self._meters[device_id]
+
+                if (
+                    friendly_name != device_id
+                    and meter.friendly_name == device_id
+                ):
+                    meter.update_name(friendly_name)
+
+        return self._meters[device_id]
+
+    def _get_meter(self, device_id: str) -> Optional[TasmotaEnergyMeter]:
+
+        with self._lock:
+            return self._meters.get(device_id)
+
+    def _handle_energy_reading(self, device_id: str, energy: Optional[dict]):
+        """Register (if new) and update an energy meter from a parsed ENERGY block."""
+
+        if not energy:
+            return
+
+        if CFG.energy_meter_enabled(device_id) is False:
+            return
+
+        meter = self._get_meter(device_id) or self._ensure_energy_meter(device_id, device_id, "unknown")
+
+        meter.set_online(True)
+        meter.set_reading(energy)
 
     # -----------------------------------------------------------------
     # Polling
