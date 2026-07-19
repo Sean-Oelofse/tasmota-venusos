@@ -336,6 +336,44 @@ except Exception as e:
     DBusGMainLoop = None
     GLib = None
 
+
+def _run_on_main_thread(fn):
+    """Run fn() on the thread that owns the GLib main loop and return its result.
+
+    dbus-python's GLib main-loop integration is not safe for creating or
+    registering D-Bus connections, or writing properties that emit signals,
+    from a thread other than the one pumping the main loop. Device creation
+    happens on the MQTT callback thread and re-init happens on a background
+    thread, so both must hand their D-Bus work off to the main thread instead
+    of touching D-Bus directly. Without this, D-Bus dispatch can silently
+    wedge after enough concurrent activity, leaving the process alive but the
+    GUI unresponsive.
+
+    In dry-run mode (no real GLib main loop) or when already on the main
+    thread, fn() runs inline.
+    """
+    if not (VENUS_OS and GLib) or threading.current_thread() is threading.main_thread():
+        return fn()
+
+    result = {}
+    done = threading.Event()
+
+    def _wrapper():
+        try:
+            result["value"] = fn()
+        except Exception as exc:
+            result["exc"] = exc
+        finally:
+            done.set()
+        return False  # one-shot
+
+    GLib.idle_add(_wrapper)
+    done.wait()
+
+    if "exc" in result:
+        raise result["exc"]
+    return result.get("value")
+
 # ---------------------------------------------------------------------
 # Zeroconf imports
 # ---------------------------------------------------------------------
@@ -430,6 +468,7 @@ class TasmotaDevice:
         self.channels      = channels
 
         self._svc          = None
+        self._bus          = None
         self._lock         = threading.Lock()
         self._mqtt_publish = None
         self._relay_state: dict = {}  # tracks latest POWER key states for 3-state reverse lookup
@@ -437,6 +476,16 @@ class TasmotaDevice:
         self._init_service()
 
     def _init_service(self):
+        """Build/rebuild the D-Bus service, always on the GLib main thread.
+
+        Called from TasmotaDevice.__init__ (on the MQTT callback thread for
+        newly-discovered devices) and from config-change re-init (on a
+        background thread), so the actual work is marshalled onto the main
+        thread via _run_on_main_thread rather than touching D-Bus here.
+        """
+        _run_on_main_thread(self._do_init_service)
+
+    def _do_init_service(self):
         three_state = CFG.is_three_state(self.device_id)
         sw_type     = TYPE_THREE_STATE if three_state else TYPE_TOGGLE
         # FIX: use separate bitmasks so three-state devices don't also show "toggle"
@@ -456,12 +505,14 @@ class TasmotaDevice:
                 prev_state[ch]  = prev_svc[f"/SwitchableOutput/{ch}/State"]
                 prev_status[ch] = prev_svc[f"/SwitchableOutput/{ch}/Status"]
 
-        kwargs = {}
+        kwargs  = {}
+        new_bus = None
 
         if VENUS_OS and dbus:
             # Use a private D-Bus connection per service to avoid
             # path collision when multiple services register '/'.
-            kwargs["bus"]      = dbus.SystemBus(private=True)
+            new_bus            = dbus.SystemBus(private=True)
+            kwargs["bus"]      = new_bus
             kwargs["register"] = False  # add paths first, then register
 
         svc = VeDbusService(svc_name, **kwargs)
@@ -494,14 +545,14 @@ class TasmotaDevice:
 
             svc.add_path(
                 f"/SwitchableOutput/{ch}/State",
-                0,
+                prev_state.get(ch, 0),
                 writeable=True,
                 onchangecallback=lambda path, val, c=ch: self._on_state_write(c, val),
             )
 
             svc.add_path(
                 f"/SwitchableOutput/{ch}/Status",
-                STATUS_OFF
+                prev_status.get(ch, STATUS_OFF)
             )
 
             svc.add_path(
@@ -589,7 +640,18 @@ class TasmotaDevice:
         if VENUS_OS and dbus and hasattr(svc, "register"):
             svc.register()
 
+        # The old private bus connection is no longer referenced by anything
+        # once the new service is live - close it now instead of leaking a
+        # D-Bus connection/socket on every re-init (three_state toggle,
+        # channel-count change, etc).
+        old_bus = self._bus
         self._svc = svc
+        self._bus = new_bus
+        if old_bus is not None:
+            try:
+                old_bus.close()
+            except Exception:
+                log.debug("Could not close previous D-Bus connection for %s", self.device_id)
 
         log.info(
             "Registered %s (%d channel(s), type=%s)",
@@ -603,12 +665,15 @@ class TasmotaDevice:
 
     def set_online(self, online: bool):
 
-        with self._lock:
-            self._svc["/Connected"] = 1 if online else 0
-            # FIX: reflect module state accurately in both directions.
-            # When offline, set /State to invalid (None) so the GUI doesn't
-            # show "Connected" for a device that has gone away.
-            self._svc["/State"] = MODULE_CONNECTED if online else None
+        def _apply():
+            with self._lock:
+                self._svc["/Connected"] = 1 if online else 0
+                # FIX: reflect module state accurately in both directions.
+                # When offline, set /State to invalid (None) so the GUI doesn't
+                # show "Connected" for a device that has gone away.
+                self._svc["/State"] = MODULE_CONNECTED if online else None
+
+        _run_on_main_thread(_apply)
 
         log.info(
             "%s -> %s",
@@ -628,61 +693,70 @@ class TasmotaDevice:
         power_key   = "POWER" if self.channels == 1 else f"POWER{channel}"
         reverse_map = CFG.reverse_relay_map(self.device_id)
 
-        with self._lock:
-            if reverse_map:
-                # Three-state path: accumulate relay state and resolve
-                self._relay_state[power_key] = state_str.upper()
-                observed  = frozenset(self._relay_state.items())
-                state_val = reverse_map.get(observed)
-                if state_val is None:
-                    # Partial update - not all relays reported yet; skip
+        def _apply():
+            with self._lock:
+                if reverse_map:
+                    # Three-state path: accumulate relay state and resolve
+                    self._relay_state[power_key] = state_str.upper()
+                    observed  = frozenset(self._relay_state.items())
+                    state_val = reverse_map.get(observed)
+                    if state_val is None:
+                        # Partial update - not all relays reported yet; skip
+                        log.debug(
+                            "%s waiting for more relay updates (%s)",
+                            self.device_id,
+                            self._relay_state
+                        )
+                        return
+                    # Don't overwrite a higher explicitly-set state (e.g. Auto=2) with a
+                    # lower inferred one (e.g. On=1) when the relay combination is ambiguous.
+                    # 'Auto' can only be cleared by an explicit write, not by a relay report.
+                    current = self._svc[f"/SwitchableOutput/0/State"]
+                    if current is not None and current > state_val:
+                        log.debug(
+                            "%s keeping explicit state %s, ignoring inferred %s from relay",
+                            self.device_id, current, state_val
+                        )
+                        return
+                    on = state_val > 0
                     log.debug(
-                        "%s waiting for more relay updates (%s)",
+                        "%s three-state relay=%s -> state %d",
+                        self.device_id, self._relay_state, state_val
+                    )
+                    for ch in range(self.channels):
+                        self._svc[f"/SwitchableOutput/{ch}/State"]  = state_val
+                        self._svc[f"/SwitchableOutput/{ch}/Status"] = STATUS_ON if on else STATUS_OFF
+                else:
+                    # Plain toggle path
+                    ch_index = channel - 1
+                    on       = state_str.upper() == "ON"
+                    self._svc[f"/SwitchableOutput/{ch_index}/State"]  = 1 if on else 0
+                    self._svc[f"/SwitchableOutput/{ch_index}/Status"] = STATUS_ON if on else STATUS_OFF
+                    log.debug(
+                        "%s CH%d -> %s",
                         self.device_id,
-                        self._relay_state
+                        channel,
+                        state_str
                     )
-                    return
-                # Don't overwrite a higher explicitly-set state (e.g. Auto=2) with a
-                # lower inferred one (e.g. On=1) when the relay combination is ambiguous.
-                # 'Auto' can only be cleared by an explicit write, not by a relay report.
-                current = self._svc[f"/SwitchableOutput/0/State"]
-                if current is not None and current > state_val:
-                    log.debug(
-                        "%s keeping explicit state %s, ignoring inferred %s from relay",
-                        self.device_id, current, state_val
-                    )
-                    return
-                on = state_val > 0
-                log.debug(
-                    "%s three-state relay=%s -> state %d",
-                    self.device_id, self._relay_state, state_val
-                )
-                for ch in range(self.channels):
-                    self._svc[f"/SwitchableOutput/{ch}/State"]  = state_val
-                    self._svc[f"/SwitchableOutput/{ch}/Status"] = STATUS_ON if on else STATUS_OFF
-            else:
-                # Plain toggle path
-                ch_index = channel - 1
-                on       = state_str.upper() == "ON"
-                self._svc[f"/SwitchableOutput/{ch_index}/State"]  = 1 if on else 0
-                self._svc[f"/SwitchableOutput/{ch_index}/Status"] = STATUS_ON if on else STATUS_OFF
-                log.debug(
-                    "%s CH%d -> %s",
-                    self.device_id,
-                    channel,
-                    state_str
-                )
+
+        _run_on_main_thread(_apply)
 
     def set_firmware(self, version: str):
 
-        with self._lock:
-            self._svc["/FirmwareVersion"] = version
+        def _apply():
+            with self._lock:
+                self._svc["/FirmwareVersion"] = version
+
+        _run_on_main_thread(_apply)
 
     def update_name(self, friendly_name: str):
 
-        with self._lock:
-            self.friendly_name = friendly_name
-            self._svc["/CustomName"] = friendly_name
+        def _apply():
+            with self._lock:
+                self.friendly_name = friendly_name
+                self._svc["/CustomName"] = friendly_name
+
+        _run_on_main_thread(_apply)
 
     def _on_state_write(self, ch_index: int, new_value):
         """Called by Venus OS when the user writes to /SwitchableOutput/x/State.
@@ -806,7 +880,8 @@ class TasmotaDiscovery:
         Runs in a background thread so this is safe to call from within a
         D-Bus write callback (e.g. ThreeState toggle from the GUI).
         """
-        reinit = (added | modified | removed) & set(self._devices)
+        with self._lock:
+            reinit = (added | modified | removed) & set(self._devices)
         if not reinit:
             return
         log.info("Config change - re-initing: %s", reinit)
@@ -926,8 +1001,18 @@ class TasmotaDiscovery:
             online = payload.lower() == "online"
 
             if online:
-                # Don't register yet  -  probe first to confirm it has relays.
-                self._probe_device(device_id)
+                # Already-confirmed devices don't need re-probing on every
+                # reconnect (WiFi hiccup, broker restart, etc) - that would
+                # needlessly spin up a fresh probe timer/thread each time.
+                # Just mark them back online; only probe devices we haven't
+                # confirmed as switches yet.
+                dev = self._get(device_id)
+
+                if dev:
+                    dev.set_online(True)
+                else:
+                    # Don't register yet  -  probe first to confirm it has relays.
+                    self._probe_device(device_id)
 
             else:
                 # Device going offline: mark existing registered device offline.
