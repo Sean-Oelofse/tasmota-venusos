@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import socket
+import fcntl
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -22,6 +23,34 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("tasmota_discovery")
+
+# ---------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------
+LOCK_PATH = os.environ.get("TASMOTA_LOCK", "/var/run/tasmota-venus.lock")
+_lock_fp  = None  # held open for the lifetime of the process
+
+def _acquire_instance_lock():
+    """Prevent multiple simultaneous instances via an exclusive file lock.
+
+    Uses a non-blocking flock so a second invocation exits immediately with
+    a clear error rather than silently running alongside the first.  The
+    lock is released automatically when the process exits.
+    """
+    global _lock_fp
+    try:
+        _lock_fp = open(LOCK_PATH, "w")
+        fcntl.flock(_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fp.write(str(os.getpid()))
+        _lock_fp.flush()
+        log.info("Instance lock acquired (%s pid=%d)", LOCK_PATH, os.getpid())
+    except OSError:
+        log.error(
+            "Another instance is already running (lock: %s) - exiting", LOCK_PATH
+        )
+        sys.exit(1)
+    except Exception as exc:
+        log.warning("Could not acquire instance lock: %s - continuing anyway", exc)
 
 # ---------------------------------------------------------------------
 # Config file
@@ -470,6 +499,7 @@ class TasmotaDevice:
         self._svc          = None
         self._bus          = None
         self._lock         = threading.Lock()
+        self._reinit_lock  = threading.Lock()
         self._mqtt_publish = None
         self._relay_state: dict = {}  # tracks latest POWER key states for 3-state reverse lookup
 
@@ -483,27 +513,44 @@ class TasmotaDevice:
         background thread), so the actual work is marshalled onto the main
         thread via _run_on_main_thread rather than touching D-Bus here.
         """
+        if not self._reinit_lock.acquire(blocking=False):
+            log.warning("%s: re-init already in progress, skipping", self.device_id)
+            return
         _run_on_main_thread(self._do_init_service)
 
     def _do_init_service(self):
-        three_state = CFG.is_three_state(self.device_id)
-        sw_type     = TYPE_THREE_STATE if three_state else TYPE_TOGGLE
-        # FIX: use separate bitmasks so three-state devices don't also show "toggle"
-        # as an option in the GUI type selector.
-        valid_types = VALID_TYPES_THREE_STATE if three_state else VALID_TYPES_TOGGLE
+        try:
+            three_state = CFG.is_three_state(self.device_id)
+            sw_type     = TYPE_THREE_STATE if three_state else TYPE_TOGGLE
+            # FIX: use separate bitmasks so three-state devices don't also show "toggle"
+            # as an option in the GUI type selector.
+            valid_types = VALID_TYPES_THREE_STATE if three_state else VALID_TYPES_TOGGLE
 
-        svc_name = f"com.victronenergy.switch.tasmota_{self.device_id}"
+            svc_name = f"com.victronenergy.switch.tasmota_{self.device_id}"
 
-        # Preserve the live switch position across re-init (e.g. toggling
-        # Auto/Manual or three_state) so the relay's actual state isn't
-        # reset to Off just because the config changed.
-        prev_svc    = self._svc
-        prev_state  = {}
-        prev_status = {}
-        if prev_svc is not None:
-            for ch in range(self.channels):
-                prev_state[ch]  = prev_svc[f"/SwitchableOutput/{ch}/State"]
-                prev_status[ch] = prev_svc[f"/SwitchableOutput/{ch}/Status"]
+            # Preserve the live switch position across re-init (e.g. toggling
+            # Auto/Manual or three_state) so the relay's actual state isn't
+            # reset to Off just because the config changed.
+            prev_svc    = self._svc
+            prev_state  = {}
+            prev_status = {}
+            if prev_svc is not None:
+                for ch in range(self.channels):
+                    prev_state[ch]  = prev_svc[f"/SwitchableOutput/{ch}/State"]
+                    prev_status[ch] = prev_svc[f"/SwitchableOutput/{ch}/Status"]
+
+            # Unregister the previous D-Bus service before creating a new one.
+            # Without this, rapidly triggered re-inits leave orphaned services on
+            # the bus that confuse the GUI and Node-RED.
+            self._svc = None
+            if prev_svc is not None and VENUS_OS and dbus:
+                try:
+                    if hasattr(prev_svc, "unregister"):
+                        prev_svc.unregister()
+                except Exception as exc:
+                    log.debug("Could not unregister old service: %s", exc)
+        finally:
+            self._reinit_lock.release()
 
         kwargs  = {}
         new_bus = None
@@ -1463,6 +1510,8 @@ class TasmotaDiscovery:
 # Main entry
 # =====================================================================
 if __name__ == "__main__":
+
+    _acquire_instance_lock()
 
     try:
         log.info("Creating discovery instance")
