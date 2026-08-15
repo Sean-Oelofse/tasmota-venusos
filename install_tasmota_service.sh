@@ -31,6 +31,7 @@ INSTALL_DIR="/opt/victronenergy/tasmota-discovery"
 SERVICE_DIR="/service/${SERVICE_NAME}"
 SVCS_PERSISTENT="/data/conf/runit/${SERVICE_NAME}"
 LOG_DIR="/var/log/${SERVICE_NAME}"
+LOCK_FILE="/run/${SERVICE_NAME}.lock"
 
 # If tasmota.py lives next to this script (local clone), use it directly.
 # Otherwise the installer will download it from GitHub.
@@ -58,6 +59,47 @@ info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()     { error "$*"; exit 1; }
+
+# -----------------------------------------------------------------------------
+# Service teardown
+#
+# daemontools/runit never kill an orphaned 'supervise' on their own. Every time
+# the /service symlink or the supervise/ lock is recreated, svscan starts a
+# fresh supervise while the old one lingers - each with its own python child.
+# Re-running this installer used to pile up orphaned supervisors, which is the
+# "multiple instances" bug. Always tear down cleanly before (re)creating so a
+# reinstall can never leave two supervisors (or two python workers) behind.
+# -----------------------------------------------------------------------------
+teardown_service() {
+    # Ask the tracked supervisor(s) to bring the service down and exit.
+    if [[ -e "${SERVICE_DIR}" ]]; then
+        svc -dx "${SERVICE_DIR}/log" 2>/dev/null || true
+        svc -dx "${SERVICE_DIR}"     2>/dev/null || true
+        sv  stop "${SERVICE_DIR}"    2>/dev/null || true
+    fi
+
+    # Remove the symlink so svscan won't respawn supervise while we clean up.
+    [[ -L "${SERVICE_DIR}" ]] && rm -f "${SERVICE_DIR}"
+
+    sleep 2
+
+    # Kill any orphaned supervisors and python workers left by earlier installs.
+    # Match on the service name / install path only, so unrelated services are
+    # never touched.
+    local pids
+    pids="$(ps w 2>/dev/null \
+        | grep -E "supervise ${SERVICE_NAME}|${INSTALL_DIR}/tasmota\.py" \
+        | grep -v grep \
+        | awk '{print $1}')"
+    if [[ -n "${pids}" ]]; then
+        warn "Killing leftover ${SERVICE_NAME} processes: $(echo ${pids})"
+        kill ${pids} 2>/dev/null || true
+        sleep 2
+        kill -9 ${pids} 2>/dev/null || true
+    fi
+
+    rm -f "${LOCK_FILE}"
+}
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -90,11 +132,9 @@ if [[ $UNINSTALL -eq 1 ]]; then
 
     info "Uninstalling ${SERVICE_NAME}..."
 
-    if [[ -d "${SERVICE_DIR}" ]]; then
-        sv stop "${SERVICE_DIR}" 2>/dev/null || true
-        rm -rf "${SERVICE_DIR}"
-        info "Removed ${SERVICE_DIR}"
-    fi
+    # Stop and remove any (possibly orphaned) supervisors + workers first.
+    teardown_service
+    info "Stopped and removed supervisors for ${SERVICE_NAME}"
 
     if [[ -d "${SVCS_PERSISTENT}" ]]; then
         rm -rf "${SVCS_PERSISTENT}"
@@ -123,6 +163,16 @@ python3 --version &>/dev/null \
 
 python3 -c "import paho.mqtt.client" 2>/dev/null \
     || die "paho-mqtt not installed. Run: pip3 install paho-mqtt"
+
+# -----------------------------------------------------------------------------
+# Tear down any existing (or orphaned) supervisors before touching files
+# -----------------------------------------------------------------------------
+# This makes reinstalls idempotent: we always start from a clean slate with no
+# lingering supervise/python, instead of stacking a new supervisor on top of
+# the old ones. SVCS_PERSISTENT (run scripts, any hand-edited config) is left
+# intact - only the running processes and the /service symlink are cleared.
+info "Clearing any existing ${SERVICE_NAME} supervisors"
+teardown_service
 
 # -----------------------------------------------------------------------------
 # Fetch tasmota.py — local copy takes priority, else download from GitHub

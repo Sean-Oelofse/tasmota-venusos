@@ -38,10 +38,34 @@ Useful commands:
     
     ./install_tasmota_service.sh --uninstall
 __________________________________________________________________________
-Enabling three state mode:
-    
+Switch type (toggle / three-state / momentary):
+
+Pick it in the GUI - Settings -> the switch -> Type - and it is saved for
+you. Or edit the config by hand:
+
     cd /data && nano tasmota_config.json
-Simply change three_state to true
+
+    "three_state": true     Off / On / Auto
+    "momentary":   true     push button
+                            (neither set = a plain toggle)
+
+three_state takes priority if both are set.
+__________________________________________________________________________
+Momentary push buttons (gates, garage doors, doorbells):
+
+    "gate": {
+      "momentary": true,
+      "pulse_ms": 600
+    }
+
+Each press closes the relay for pulse_ms milliseconds and then releases it
+again, instead of latching on. pulse_ms is optional and defaults to 600,
+which is also the minimum - anything lower is raised to 600 so the contact
+is long enough for gate and garage-door controllers to see.
+
+Holding the button down does not extend the pulse; pressing again while one
+is running does. A relay that was left on is released as soon as the channel
+becomes momentary, so a button never sits there energised.
 
 <img width="285" height="701" alt="image" src="https://github.com/user-attachments/assets/a89218e7-6e2a-4ae8-9213-9a2c3d605f31" />
 
