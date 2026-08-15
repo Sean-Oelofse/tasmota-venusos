@@ -2,8 +2,7 @@
 Python integration for Tasmota that allows switch panel integration.
 
 
-<img width="342" height="444" alt="image" src="https://github.com/user-attachments/assets/08aaab9e-6d9b-43e6-b113-251e101478b6" />
-<img width="649" height="338" alt="image" src="https://github.com/user-attachments/assets/275f0fa4-e928-4263-93cf-2ee5bde5c01b" />
+<img width="1000" height="700" alt="image" src="https://github.com/user-attachments/assets/56004b4a-02ca-4d00-a802-b3c2ad52b24c" />
 
 
 
@@ -50,6 +49,8 @@ you. Or edit the config by hand:
                             (neither set = a plain toggle)
 
 three_state takes priority if both are set.
+<img width="1184" height="785" alt="image" src="https://github.com/user-attachments/assets/3d6667f2-38fa-4b59-add9-e986b5802c5c" />
+
 __________________________________________________________________________
 Momentary push buttons (gates, garage doors, doorbells):
 
@@ -67,5 +68,4 @@ Holding the button down does not extend the pulse; pressing again while one
 is running does. A relay that was left on is released as soon as the channel
 becomes momentary, so a button never sits there energised.
 
-<img width="285" height="701" alt="image" src="https://github.com/user-attachments/assets/a89218e7-6e2a-4ae8-9213-9a2c3d605f31" />
 
