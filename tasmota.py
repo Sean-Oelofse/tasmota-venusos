@@ -65,7 +65,7 @@ from typing import Optional, List, Dict, Any
 
 import paho.mqtt.client as mqtt
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 # ---------------------------------------------------------------------
 # Logging
@@ -691,8 +691,18 @@ class ConfigManager:
     def register_device(self, device_id: str, friendly_name: str, ip: str, channels: int):
         """Create the config stub for a newly discovered device.
 
-        Existing entries are never replaced, so hand-written keys such as
-        state_relay_map survive rediscovery.
+        Existing values are never overwritten, so hand-written keys such as
+        state_relay_map - and any type already chosen in the GUI - survive
+        rediscovery.  The informational fields are always refreshed; the
+        behavioural defaults are only filled in when absent.
+
+        The defaults must be applied with setdefault rather than only on a
+        brand-new entry: assign_instance() runs while the switch service is
+        built, which is *before* this method, so by the time we get here the
+        entry usually already exists as a bare ``{"instance": N}`` stub.  The
+        old "new entry vs existing entry" branch treated that stub as an
+        existing device and never wrote three_state/momentary, leaving the
+        keys the README tells users to edit missing from the config file.
         """
         with self._io_lock:
             raw     = self._read_raw()
@@ -701,24 +711,22 @@ class ConfigManager:
                 devices = raw["devices"] = {}
 
             entry = devices.get(device_id)
-            if isinstance(entry, dict) and entry:
-                # Only refresh the informational fields.
-                entry["_name"]     = friendly_name
-                entry["_ip"]       = ip
-                entry["_channels"] = channels
-            else:
-                devices[device_id] = {
-                    "_name":       friendly_name,
-                    "_ip":         ip,
-                    "_channels":   channels,
-                    # Set to true - or pick "Three-state switch" in the GUI's
-                    # switch settings - to use Off / On / Auto.
-                    "three_state": False,
-                    # Set to true - or pick "Momentary" in the GUI's switch
-                    # settings - to turn this into a push button that pulses
-                    # the relay for "pulse_ms" (default and minimum 600ms).
-                    "momentary":   False,
-                }
+            if not isinstance(entry, dict):
+                entry = devices[device_id] = {}
+
+            # Informational fields: always refreshed.
+            entry["_name"]     = friendly_name
+            entry["_ip"]       = ip
+            entry["_channels"] = channels
+
+            # Behavioural defaults: filled in only when absent, so a value set
+            # by hand or through the GUI's switch settings is preserved.
+            # Set three_state to true - or pick "Three-state switch" in the
+            # GUI - to use Off / On / Auto.  Set momentary to true - or pick
+            # "Momentary" - to turn this into a push button that pulses the
+            # relay for "pulse_ms" (default and minimum 600ms).
+            entry.setdefault("three_state", False)
+            entry.setdefault("momentary",   False)
 
             if not self._write_raw(raw):
                 return

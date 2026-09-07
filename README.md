@@ -31,11 +31,14 @@ Useful commands:
     
     svc -t /service/tasmota-discovery   # restart
 
-  To update the script after changes:
+  To update the script after changes, copy it in and restart the service:
     
     cp tasmota.py /opt/victronenergy/tasmota-discovery/
     
-    ./install_tasmota_service.sh --uninstall
+    svc -t /service/tasmota-discovery
+
+  (Do not run the installer with --uninstall to update - that removes the
+  service and the install directory, including the file you just copied in.)
 __________________________________________________________________________
 Switch type (toggle / three-state / momentary):
 
