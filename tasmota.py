@@ -2716,6 +2716,11 @@ def main() -> int:
         return 0
     except Exception:
         log.exception("Fatal error")
+        # daemontools will restart us immediately.  Throttle so a persistent
+        # fault (bad config, unreachable broker on a misconfigured host) does
+        # not crash-loop several times a second and bury its own traceback in
+        # the log.  The stack trace above is the thing to read to see why.
+        time.sleep(5)
         return 1
     finally:
         guard.release()

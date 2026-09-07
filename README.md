@@ -27,9 +27,25 @@ Or if you would like a simple way to install run:
 __________________________________________________________________________
 Useful commands:
 
-    svstat /service/tasmota-discovery    # check status
+    svstat /service/tasmota-discovery    # check status / uptime
     
     svc -t /service/tasmota-discovery   # restart
+    
+    svc -d /service/tasmota-discovery   # stop
+    
+    svc -u /service/tasmota-discovery   # start
+
+  Checking the log (to see why it may have crashed).
+  Venus OS supervises with daemontools and logs via multilog, so the log
+  lines carry TAI64N timestamps - pipe them through tai64nlocal to read them:
+
+    tail -F /var/log/tasmota-discovery/current | tai64nlocal   # live log
+
+    grep -i error /var/log/tasmota-discovery/current | tai64nlocal
+
+  A service that svstat shows restarting (its uptime keeps resetting to a few
+  seconds) is crash-looping; the log above will show the traceback. daemontools
+  restarts it automatically, so a genuine fix is a config or connectivity one.
 
   To update the script after changes, copy it in and restart the service:
     
