@@ -27,15 +27,34 @@ Or if you would like a simple way to install run:
 __________________________________________________________________________
 Useful commands:
 
-    svstat /service/tasmota-discovery    # check status
+    svstat /service/tasmota-discovery    # check status / uptime
     
     svc -t /service/tasmota-discovery   # restart
+    
+    svc -d /service/tasmota-discovery   # stop
+    
+    svc -u /service/tasmota-discovery   # start
 
-  To update the script after changes:
+  Checking the log (to see why it may have crashed).
+  Venus OS supervises with daemontools and logs via multilog, so the log
+  lines carry TAI64N timestamps - pipe them through tai64nlocal to read them:
+
+    tail -F /var/log/tasmota-discovery/current | tai64nlocal   # live log
+
+    grep -i error /var/log/tasmota-discovery/current | tai64nlocal
+
+  A service that svstat shows restarting (its uptime keeps resetting to a few
+  seconds) is crash-looping; the log above will show the traceback. daemontools
+  restarts it automatically, so a genuine fix is a config or connectivity one.
+
+  To update the script after changes, copy it in and restart the service:
     
     cp tasmota.py /opt/victronenergy/tasmota-discovery/
     
-    ./install_tasmota_service.sh --uninstall
+    svc -t /service/tasmota-discovery
+
+  (Do not run the installer with --uninstall to update - that removes the
+  service and the install directory, including the file you just copied in.)
 __________________________________________________________________________
 Switch type (toggle / three-state / momentary):
 

@@ -72,10 +72,12 @@ die()     { error "$*"; exit 1; }
 # -----------------------------------------------------------------------------
 teardown_service() {
     # Ask the tracked supervisor(s) to bring the service down and exit.
+    # Venus OS supervises with daemontools, so this is svc(8) - not runit's
+    # sv(8), which is not shipped on Venus OS.  -d takes the service down, -x
+    # tells the matching 'supervise' to exit once it is down.
     if [[ -e "${SERVICE_DIR}" ]]; then
         svc -dx "${SERVICE_DIR}/log" 2>/dev/null || true
         svc -dx "${SERVICE_DIR}"     2>/dev/null || true
-        sv  stop "${SERVICE_DIR}"    2>/dev/null || true
     fi
 
     # Remove the symlink so svscan won't respawn supervise while we clean up.
@@ -223,15 +225,26 @@ if [ -f /opt/victronenergy/tasmota-discovery/environment ]; then
     . /opt/victronenergy/tasmota-discovery/environment
     set +a
 fi
+# Send stderr (where Python logging writes) to stdout so the log service
+# captures it, and run Python unbuffered (-u) so the lines that explain a
+# crash reach the log before the process dies, instead of sitting in a pipe
+# buffer that is lost on exit.
 exec 2>&1
-exec python3 /opt/victronenergy/tasmota-discovery/tasmota.py
+exec python3 -u /opt/victronenergy/tasmota-discovery/tasmota.py
 RUNEOF
 chmod 755 "${SVCS_PERSISTENT}/run"
 
 mkdir -p "${LOG_DIR}"
+# Venus OS logs with daemontools' multilog, the same way its own drivers do
+# (e.g. "multilog t s99999 n8 /var/log/<service>").  runit's svlogd is not
+# shipped, so a log/run that called it would fail and the crash output that
+# should explain *why* the service died would be thrown away.
+#   t       prefix each line with a TAI64N timestamp (read with tai64nlocal)
+#   s99999  rotate at ~100 kB per file
+#   n8      keep 8 rotated files
 cat > "${SVCS_PERSISTENT}/log/run" <<LOGEOF
 #!/bin/sh
-exec svlogd -tt ${LOG_DIR}
+exec multilog t s99999 n8 ${LOG_DIR}
 LOGEOF
 chmod 755 "${SVCS_PERSISTENT}/log/run"
 
@@ -278,14 +291,32 @@ fi
 
 # -----------------------------------------------------------------------------
 # Start the service
+#
+# Venus OS runs daemontools' svscan against /service, which notices the new
+# symlink on its own within a few seconds and starts a 'supervise' for it.
+# We wait for that to happen (svstat reports the service), then svc -t to
+# restart it so the tasmota.py we just installed is the copy that is running,
+# not any older one supervise may have started first. svc(8)/svstat(8) are the
+# daemontools tools Venus ships - runit's sv(8) is not present here.
 # -----------------------------------------------------------------------------
-info "Starting service via sv..."
-sleep 1
+info "Waiting for daemontools to pick up ${SERVICE_NAME}..."
 
-if sv status "${SERVICE_DIR}" &>/dev/null; then
-    sv restart "${SERVICE_DIR}"
+started=0
+for _ in $(seq 1 15); do
+    if svstat "${SERVICE_DIR}" &>/dev/null; then
+        started=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ "${started}" -eq 1 ]]; then
+    svc -t "${SERVICE_DIR}" 2>/dev/null || true   # restart with the new code
+    sleep 1
+    info "Service status: $(svstat "${SERVICE_DIR}" 2>/dev/null || echo unknown)"
 else
-    sv start "${SERVICE_DIR}" || warn "sv start returned non-zero — check 'sv status ${SERVICE_DIR}'"
+    warn "daemontools has not started ${SERVICE_DIR} yet."
+    warn "It usually appears within a few seconds — check: svstat ${SERVICE_DIR}"
 fi
 
 # -----------------------------------------------------------------------------
@@ -302,10 +333,14 @@ echo "  Log dir     : ${LOG_DIR}"
 echo "  MQTT host   : ${MQTT_HOST}:${MQTT_PORT}"
 echo ""
 echo "  Useful commands:"
-echo "    sv status ${SERVICE_DIR}    # check status"
-echo "    sv restart ${SERVICE_DIR}   # restart"
-echo "    sv stop ${SERVICE_DIR}      # stop"
-echo "    tail -f ${LOG_DIR}/current  # live log"
+echo "    svstat ${SERVICE_DIR}                     # check status / uptime"
+echo "    svc -t ${SERVICE_DIR}                     # restart"
+echo "    svc -d ${SERVICE_DIR}                     # stop"
+echo "    svc -u ${SERVICE_DIR}                     # start"
+echo ""
+echo "  Reading the log (timestamps decoded with tai64nlocal):"
+echo "    tail -F ${LOG_DIR}/current | tai64nlocal      # live log"
+echo "    grep -i error ${LOG_DIR}/current | tai64nlocal   # why it crashed"
 echo ""
 echo "  To update to the latest version from GitHub:"
 echo "    bash <(curl -fsSL ${GITHUB_RAW}/install_tasmota_service.sh) --mqtt-host ${MQTT_HOST}"
